@@ -1,0 +1,40 @@
+engine,metric,case,query,query_len,sort,matches,first_ms,full_ms,value,unit,note
+meta,build_time,,,,,,,,5793.046,ms,SQLite plus FTS5 plus projection
+meta,sqlite_startup,,,,,,,,23.601,ms,warm open and count
+meta,projection_load,,,,,,,,12.475,ms,read two contiguous arrays
+meta,sqlite_disk,,,,,,,,352501760,bytes,checkpointed database
+meta,projection_disk,,,,,,,,101099194,bytes,fixed records plus string arena
+meta,process_current_rss,,,,,,,,115008,KiB,resident set after loading projection
+meta,process_peak_rss,,,,,,,,124192,KiB,conservative upper bound including build
+memory,query,one-char,r,1,relevance,937500,0.001,105.925,,
+memory,query,two-char,re,2,relevance,375000,0.001,96.190,,
+memory,query,substring,port,4,relevance,250000,0.001,101.296,,
+memory,query,multi-term,report pdf,10,modified,20834,108.424,109.535,,
+memory,query,unicode,résumé,8,relevance,62500,0.001,115.889,,
+memory,query,case-normalized,readme,6,relevance,62500,0.002,117.347,,
+fts5,query,substring,port,4,relevance,250000,374.882,384.465,,
+fts5,query,multi-term,report pdf,10,modified,20834,53.972,57.446,,
+fts5,query,unicode,résumé,8,relevance,62500,119.052,116.530,,
+fts5,query,case-normalized,readme,6,relevance,62500,115.157,115.203,,
+hybrid,query,one-char,r,1,relevance,937500,0.001,99.167,,
+hybrid,query,two-char,re,2,relevance,375000,0.001,98.134,,
+hybrid,query,substring,port,4,relevance,250000,402.774,475.251,,
+hybrid,query,multi-term,report pdf,10,modified,20834,58.417,56.187,,
+hybrid,query,unicode,résumé,8,relevance,62500,115.900,118.603,,
+hybrid,query,case-normalized,readme,6,relevance,62500,116.847,122.529,,
+memory,query,selectable-sort,report,6,name,62500,109.315,138.038,,
+hybrid,query,selectable-sort,report,6,name,62500,145.982,152.007,,
+memory,query,selectable-sort,report,6,path,62500,108.720,122.423,,
+hybrid,query,selectable-sort,report,6,path,62500,140.883,140.882,,
+memory,query,selectable-sort,report,6,modified,62500,102.968,106.498,,
+hybrid,query,selectable-sort,report,6,modified,62500,118.454,116.747,,
+memory,query,selectable-sort,report,6,created,62500,100.837,105.401,,
+hybrid,query,selectable-sort,report,6,created,62500,116.287,119.613,,
+memory,query,selectable-sort,report,6,size,62500,105.934,114.977,,
+hybrid,query,selectable-sort,report,6,size,62500,123.508,120.785,,
+sqlite+fts5,update,batch-1,,,relevance,1,,3.341,,,transactional searchable updates
+memory,update,batch-1,,,relevance,1,,0.000,,,in-place cache updates after transaction
+sqlite+fts5,update,batch-100,,,relevance,100,,1.049,,,transactional searchable updates
+memory,update,batch-100,,,relevance,100,,0.025,,,in-place cache updates after transaction
+sqlite+fts5,update,batch-10000,,,relevance,10000,,84.964,,,transactional searchable updates
+memory,update,batch-10000,,,relevance,10000,,0.184,,,in-place cache updates after transaction
