@@ -1,0 +1,115 @@
+<!doctype html>
+<!-- Three variants of the Quick Search Window, switchable via ?variant=A|B|C. THROWAWAY PROTOTYPE. -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Everyfile · Quick Search Window Prototype</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at 50% 18%,#3c4353,#16181d 60%); color:#f4f5f7; overflow:hidden; }
+    button,input,select { font:inherit; }
+    button { color:inherit; }
+    .desktop { min-height:100vh; padding:8vh 5vw 100px; }
+    .window { margin:auto; overflow:hidden; background:rgba(24,26,31,.94); border:1px solid rgba(255,255,255,.15); box-shadow:0 30px 90px #000a; backdrop-filter:blur(28px); }
+    .search { display:flex; align-items:center; gap:12px; }
+    .search input { flex:1; border:0; outline:0; color:#fff; background:transparent; }
+    .icon { color:#aeb4c0; font-size:20px; }
+    .kbd { border:1px solid #ffffff28; border-bottom-color:#ffffff45; border-radius:6px; padding:2px 7px; background:#ffffff0d; color:#b9bec8; font-size:11px; white-space:nowrap; }
+    .muted { color:#9ba2af; }
+    .status-dot { width:7px;height:7px;border-radius:50%;background:#66d487;box-shadow:0 0 8px #66d487;display:inline-block; }
+    .row { cursor:default; }
+    .row.selected { background:#316acb !important; color:white; }
+    .row.selected .muted { color:#dbe8ff; }
+    .file-icon { width:30px;height:30px;border-radius:7px;background:#4777d9;display:grid;place-items:center;font-size:15px;flex:none; }
+    .switcher { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); display:flex; align-items:center; gap:8px; padding:8px; border-radius:999px; background:#050608f0; border:1px solid #ffffff35; box-shadow:0 8px 35px #000; z-index:10; }
+    .switcher button { border:0;background:#252932;border-radius:999px;width:34px;height:34px;cursor:pointer; }
+    .switcher strong { min-width:235px;text-align:center;font-size:13px; }
+    .state { position:fixed; right:16px; top:16px; padding:8px 11px; border-radius:9px; background:#090a0ddd; border:1px solid #ffffff1f; color:#aeb4c0; font:11px ui-monospace,monospace; z-index:8; }
+    .action { border:1px solid #ffffff20;background:#ffffff0a;border-radius:7px;padding:6px 9px;cursor:pointer; }
+
+    /* A: dense Everything-style table */
+    .a .window { width:min(1060px,92vw); height:min(610px,78vh); border-radius:12px; display:flex;flex-direction:column; }
+    .a .search { padding:15px 18px; border-bottom:1px solid #ffffff18; }
+    .a .search input { font-size:22px; }
+    .a .toolbar { display:flex;gap:8px;padding:8px 12px;border-bottom:1px solid #ffffff12;background:#ffffff05; }
+    .a .toolbar select,.a .toolbar button { border:1px solid #ffffff18;background:#292c33;border-radius:6px;padding:5px 9px;color:#e8eaed; }
+    .a table { border-collapse:collapse;width:100%;font-size:13px; }
+    .a th { text-align:left;color:#adb3be;font-weight:500;padding:8px 10px;border-bottom:1px solid #ffffff16;background:#1d1f24; }
+    .a td { padding:7px 10px;border-bottom:1px solid #ffffff0b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:420px; }
+    .a tbody tr:nth-child(even) { background:#ffffff04; }
+    .a .table-wrap { overflow:auto;flex:1; }
+    .a footer { display:flex;justify-content:space-between;padding:8px 12px;border-top:1px solid #ffffff14;font-size:12px; }
+
+    /* B: Spotlight command palette */
+    .b .window { width:min(740px,90vw); height:min(590px,76vh); border-radius:22px; }
+    .b .search { padding:22px 24px;border-bottom:1px solid #ffffff15; }
+    .b .search input { font-size:27px;font-weight:500; }
+    .b .meta { display:flex;justify-content:space-between;padding:10px 20px 6px;font-size:12px; }
+    .b .results { padding:8px; }
+    .b .row { display:flex;align-items:center;gap:12px;padding:12px;border-radius:12px; }
+    .b .row .main { min-width:0;flex:1; }
+    .b .row .name { font-size:15px;font-weight:600; }
+    .b .row .path { overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;margin-top:3px; }
+    .b .actions { display:none;gap:6px; }
+    .b .selected .actions { display:flex; }
+    .b footer { position:absolute;left:0;right:0;bottom:0;padding:12px 20px;border-top:1px solid #ffffff15;background:#17191edf;display:flex;justify-content:space-between;font-size:12px; }
+    .b .window { position:relative; }
+
+    /* C: context-first three pane */
+    .c .window { width:min(1120px,94vw);height:min(650px,80vh);border-radius:18px;display:grid;grid-template:72px 1fr 34px / 190px 1fr 310px; }
+    .c .search { grid-column:1/4;padding:15px 20px;border-bottom:1px solid #ffffff18; }
+    .c .search input { font-size:23px; }
+    .c aside { padding:15px;border-right:1px solid #ffffff16;background:#ffffff04; }
+    .c aside button { width:100%;text-align:left;border:0;background:transparent;padding:8px;border-radius:7px;margin-bottom:3px; }
+    .c aside button.active { background:#ffffff16; }
+    .c .list { overflow:auto;padding:8px; }
+    .c .row { display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:center;padding:9px;border-radius:9px; }
+    .c .detail { border-left:1px solid #ffffff16;padding:28px 20px;text-align:center;background:#11131880; }
+    .c .preview { width:112px;height:130px;margin:12px auto 20px;border-radius:12px;background:linear-gradient(145deg,#5b8dea,#315ab7);display:grid;place-items:center;font-size:42px;box-shadow:0 14px 30px #0006; }
+    .c .detail .path { word-break:break-all;font-size:12px;line-height:1.5; }
+    .c .detail-actions { display:flex;flex-direction:column;gap:8px;margin-top:22px; }
+    .c footer { grid-column:1/4;display:flex;justify-content:space-between;padding:8px 13px;border-top:1px solid #ffffff15;font-size:11px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="state" class="state"></div>
+  <nav class="switcher" aria-label="Prototype variants">
+    <button id="prev">←</button><strong id="variant-label"></strong><button id="next">→</button>
+  </nav>
+  <script>
+    const variants = [
+      { key:'A', name:'Dense Results Table' },
+      { key:'B', name:'Keyboard Command Palette' },
+      { key:'C', name:'Context & Preview' }
+    ];
+    const files = [
+      {icon:'RS',name:'main.rs',path:'/Users/liyixin/repos/rust/everyfile/src/main.rs',kind:'Rust source',modified:'今天 18:42',size:'1 KB',hidden:false},
+      {icon:'MD',name:'CONTEXT.md',path:'/Users/liyixin/repos/rust/everyfile/CONTEXT.md',kind:'Markdown',modified:'今天 18:15',size:'1 KB',hidden:false},
+      {icon:'📁',name:'everyfile',path:'/Users/liyixin/repos/rust/everyfile',kind:'文件夹',modified:'今天 18:42',size:'—',hidden:false},
+      {icon:'⚙',name:'.gitignore',path:'/Users/liyixin/repos/rust/everyfile/.gitignore',kind:'隐藏文件',modified:'昨天 23:04',size:'12 B',hidden:true},
+      {icon:'PDF',name:'Everything design notes.pdf',path:'/Users/liyixin/Documents/Everyfile/Everything design notes.pdf',kind:'PDF',modified:'8月17日',size:'2.4 MB',hidden:false},
+      {icon:'PNG',name:'everyfile-icon.png',path:'/Users/liyixin/Pictures/everyfile-icon.png',kind:'PNG image',modified:'8月12日',size:'480 KB',hidden:false},
+      {icon:'TOML',name:'Cargo.toml',path:'/Users/liyixin/repos/rust/everyfile/Cargo.toml',kind:'TOML',modified:'8月10日',size:'96 B',hidden:false}
+    ];
+    const state = { query:'everyfile', selected:0, showHidden:true, sort:'相关性', direction:'降序', refreshing:true };
+    function currentVariant(){ const key=new URLSearchParams(location.search).get('variant')||'A'; return variants.find(v=>v.key===key)||variants[0]; }
+    function visible(){ const q=state.query.toLowerCase().trim(); return files.filter(f=>(state.showHidden||!f.hidden)&&(!q||(`${f.name} ${f.path}`).toLowerCase().includes(q))); }
+    function commonSearch(){ return `<div class="search"><span class="icon">⌕</span><input id="query" value="${state.query}" aria-label="搜索文件名和路径" placeholder="搜索文件名和路径"><span class="kbd">⌥ Space</span></div>`; }
+    function rowsA(){ return visible().map((f,i)=>`<tr class="row ${i===state.selected?'selected':''}" data-i="${i}"><td>${f.name}</td><td class="muted">${f.path}</td><td>${f.modified}</td><td>${f.size}</td></tr>`).join(''); }
+    function rowsB(){ return visible().map((f,i)=>`<div class="row ${i===state.selected?'selected':''}" data-i="${i}"><div class="file-icon">${f.icon}</div><div class="main"><div class="name">${f.name}</div><div class="path muted">${f.path}</div></div><div class="actions"><button class="action">打开 ↩</button><button class="action">Finder ⌘↩</button></div></div>`).join(''); }
+    function rowsC(){ return visible().map((f,i)=>`<div class="row ${i===state.selected?'selected':''}" data-i="${i}"><div class="file-icon">${f.icon}</div><div><b>${f.name}</b><div class="muted" style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${f.path}</div></div><span class="muted" style="font-size:11px">${f.modified}</span></div>`).join(''); }
+    function renderA(){ return `<main class="desktop a"><section class="window">${commonSearch()}<div class="toolbar"><select id="sort"><option>${state.sort}</option><option>修改时间</option><option>创建时间</option><option>文件名</option><option>完整路径</option><option>文件大小</option></select><button id="dir">${state.direction} ↕</button><button id="hidden">隐藏项目：${state.showHidden?'显示':'隐藏'} <span class="kbd">⌘⇧.</span></button></div><div class="table-wrap"><table><thead><tr><th>名称</th><th>路径</th><th>修改时间</th><th>大小</th></tr></thead><tbody>${rowsA()}</tbody></table></div><footer><span>${visible().length} 个结果</span><span><i class="status-dot"></i> ${state.refreshing?'正在补齐索引 · 结果可用':'索引已更新'}</span></footer></section></main>`; }
+    function renderB(){ return `<main class="desktop b"><section class="window">${commonSearch()}<div class="meta"><span>${visible().length} 个匹配 · ${state.sort}</span><span>${state.refreshing?'正在检查文件变化…':'索引已更新'}</span></div><div class="results">${rowsB()}</div><footer><span>↑↓ 选择　↩ 打开　⌘↩ 在 Finder 中显示</span><span>⌘⇧. ${state.showHidden?'隐藏':'显示'}隐藏项目</span></footer></section></main>`; }
+    function renderC(){ const f=visible()[state.selected]||files[0]; return `<main class="desktop c"><section class="window">${commonSearch()}<aside><b>搜索范围</b><button class="active">全部文件</button><button>文稿</button><button>代码</button><button>图片</button><hr style="border-color:#ffffff16"><b>排序方式</b><button class="active">${state.sort} · ${state.direction}</button><button id="hidden">${state.showHidden?'✓ ':''}隐藏项目</button></aside><div class="list">${rowsC()}</div><section class="detail"><div class="preview">${f.icon}</div><h3>${f.name}</h3><p class="path muted">${f.path}</p><p class="muted">${f.kind} · ${f.size}<br>修改于 ${f.modified}</p><div class="detail-actions"><button class="action">打开</button><button class="action">在 Finder 中显示</button><button class="action">复制路径</button></div></section><footer><span>${visible().length} 个结果</span><span>${state.refreshing?'索引补齐中':'索引已更新'} · 后台 CPU 0.1%</span></footer></section></main>`; }
+    function render(){ const v=currentVariant(); app.innerHTML=v.key==='A'?renderA():v.key==='B'?renderB():renderC(); document.getElementById('variant-label').textContent=`${v.key} · ${v.name}`; document.getElementById('state').textContent=JSON.stringify(state); bind(); }
+    function bind(){ const input=document.getElementById('query'); input?.addEventListener('input',e=>{state.query=e.target.value;state.selected=0;render();document.getElementById('query')?.focus();}); document.querySelectorAll('[data-i]').forEach(el=>el.addEventListener('click',()=>{state.selected=+el.dataset.i;render();})); document.getElementById('hidden')?.addEventListener('click',()=>{state.showHidden=!state.showHidden;state.selected=0;render();}); document.getElementById('sort')?.addEventListener('change',e=>{state.sort=e.target.value;render();}); document.getElementById('dir')?.addEventListener('click',()=>{state.direction=state.direction==='降序'?'升序':'降序';render();}); }
+    function cycle(delta){ const v=currentVariant();const i=variants.findIndex(x=>x.key===v.key);const next=variants[(i+delta+variants.length)%variants.length];const u=new URL(location);u.searchParams.set('variant',next.key);history.replaceState({},'',u);render(); }
+    prev.onclick=()=>cycle(-1);next.onclick=()=>cycle(1);
+    addEventListener('keydown',e=>{ const editing=['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)||document.activeElement?.isContentEditable; if(!editing&&e.key==='ArrowLeft')cycle(-1); if(!editing&&e.key==='ArrowRight')cycle(1); if(e.metaKey&&e.shiftKey&&e.key==='.') { e.preventDefault();state.showHidden=!state.showHidden;state.selected=0;render(); } if(e.key==='ArrowDown'&&editing){e.preventDefault();state.selected=Math.min(state.selected+1,visible().length-1);render();document.getElementById('query')?.focus();} if(e.key==='ArrowUp'&&editing){e.preventDefault();state.selected=Math.max(0,state.selected-1);render();document.getElementById('query')?.focus();} });
+    setTimeout(()=>{state.refreshing=false;render();},3200);render();document.getElementById('query')?.focus();
+  </script>
+</body>
+</html>
