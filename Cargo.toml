@@ -5,9 +5,14 @@ edition = "2024"
 
 [dependencies]
 crossbeam-channel = "0.5.16"
+libc = "0.2.189"
+memmap2 = "0.9.8"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
+
+[dev-dependencies]
+tempfile = "3.23.0"

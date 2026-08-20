@@ -1,5 +1,10 @@
+pub mod coordinator;
+pub mod index;
 pub mod model;
+pub mod projection;
+pub mod scanner;
 pub mod scheduler;
+pub mod volume;
 
 #[cfg(target_os = "macos")]
 mod macos;
