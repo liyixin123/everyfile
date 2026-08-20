@@ -1,8 +1,9 @@
 #![allow(non_upper_case_globals)]
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use objc2::rc::Retained;
@@ -11,17 +12,22 @@ use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSApplication,
     NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSFont, NSMenu, NSMenuItem, NSScrollView,
-    NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTextField, NSVariableStatusItemLength,
+    NSBackingStoreType, NSColor, NSControlTextEditingDelegate, NSFloatingWindowLevel, NSFont,
+    NSMenu, NSMenuItem, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView,
+    NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSVariableStatusItemLength, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSTimer,
     NSUserDefaults, ns_string,
 };
 
-use crate::model::AppSnapshot;
+use crate::coordinator::{
+    build_first_index_with_progress, configured_root, default_data_directory,
+};
+use crate::model::{AppSnapshot, FileIndexState, SearchResult};
+use crate::projection::SearchProjection;
 use crate::scheduler::BackgroundScheduler;
 
 const hot_key_signature: u32 = u32::from_be_bytes(*b"EvFl");
@@ -82,10 +88,30 @@ unsafe extern "C" {
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     search_field: OnceCell<Retained<NSTextField>>,
+    table: OnceCell<Retained<NSTableView>>,
+    state_title: OnceCell<Retained<NSTextField>>,
+    state_detail: OnceCell<Retained<NSTextField>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
+    status_state_item: OnceCell<Retained<NSMenuItem>>,
     scheduler: OnceCell<BackgroundScheduler>,
+    runtime: Arc<Mutex<RuntimeIndex>>,
+    results: RefCell<Vec<SearchResult>>,
     hot_key: Cell<EventHotKeyRef>,
     launch: Instant,
+}
+
+struct RuntimeIndex {
+    state: FileIndexState,
+    projection: Option<Arc<SearchProjection>>,
+    error: Option<String>,
+}
+
+struct SearchWindowParts {
+    window: Retained<NSWindow>,
+    search_field: Retained<NSTextField>,
+    table: Retained<NSTableView>,
+    state_title: Retained<NSTextField>,
+    state_detail: Retained<NSTextField>,
 }
 
 impl Default for AppDelegateIvars {
@@ -93,8 +119,18 @@ impl Default for AppDelegateIvars {
         Self {
             window: OnceCell::new(),
             search_field: OnceCell::new(),
+            table: OnceCell::new(),
+            state_title: OnceCell::new(),
+            state_detail: OnceCell::new(),
             status_item: OnceCell::new(),
+            status_state_item: OnceCell::new(),
             scheduler: OnceCell::new(),
+            runtime: Arc::new(Mutex::new(RuntimeIndex {
+                state: FileIndexState::NotAvailable,
+                projection: None,
+                error: None,
+            })),
+            results: RefCell::new(Vec::new()),
             hot_key: Cell::new(ptr::null_mut()),
             launch: Instant::now(),
         }
@@ -125,10 +161,18 @@ define_class!(
                 .ok()
                 .expect("scheduler must only initialize once");
 
-            let (window, search_field) = build_search_window(mtm, &AppSnapshot::default());
-            self.ivars().window.set(window).unwrap();
-            self.ivars().search_field.set(search_field).unwrap();
-            self.ivars().status_item.set(build_status_item(mtm, self)).unwrap();
+            let parts = build_search_window(mtm, &AppSnapshot::default(), self);
+            self.ivars().window.set(parts.window).unwrap();
+            self.ivars().search_field.set(parts.search_field).unwrap();
+            self.ivars().table.set(parts.table).unwrap();
+            self.ivars().state_title.set(parts.state_title).unwrap();
+            self.ivars().state_detail.set(parts.state_detail).unwrap();
+            let (status_item, status_state_item) = build_status_item(mtm, self);
+            self.ivars().status_item.set(status_item).unwrap();
+            self.ivars()
+                .status_state_item
+                .set(status_state_item)
+                .unwrap();
 
             unsafe { install_hot_key_handler(self) };
             if !self.register_saved_shortcut() {
@@ -138,6 +182,16 @@ define_class!(
                 "everyfile event=application_ready elapsed_ms={}",
                 self.ivars().launch.elapsed().as_millis()
             );
+            unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.1,
+                    self,
+                    sel!(refreshIndexState:),
+                    None,
+                    true,
+                )
+            };
+            self.start_initial_index();
             self.show_search_window();
         }
 
@@ -147,6 +201,46 @@ define_class!(
             if !hot_key.is_null() {
                 unsafe { UnregisterEventHotKey(hot_key) };
             }
+        }
+    }
+
+    unsafe impl NSTableViewDataSource for Delegate {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows(&self, _table_view: &NSTableView) -> isize {
+            self.ivars().results.borrow().len() as isize
+        }
+
+    }
+
+    unsafe impl NSControlTextEditingDelegate for Delegate {}
+
+    unsafe impl NSTableViewDelegate for Delegate {
+        #[unsafe(method_id(tableView:viewForTableColumn:row:))]
+        fn table_view(
+            &self,
+            _table_view: &NSTableView,
+            table_column: Option<&NSTableColumn>,
+            row: isize,
+        ) -> Option<Retained<NSView>> {
+            let results = self.ivars().results.borrow();
+            let result = &results[row as usize];
+            let table_column = table_column.expect("table view requests a known column");
+            let identifier = table_column.identifier().to_string();
+            let value = match identifier.as_str() {
+                "name" => result.name.clone(),
+                "path" => result.path.to_string_lossy().into_owned(),
+                "modified" => result
+                    .modified_ns
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                "size" => result.size.to_string(),
+                _ => String::new(),
+            };
+            let label = NSTextField::labelWithString(
+                &objc2_foundation::NSString::from_str(&value),
+                self.mtm(),
+            );
+            Some(label.into_super().into_super())
         }
     }
 
@@ -164,6 +258,16 @@ define_class!(
         #[unsafe(method(quitEveryfile:))]
         fn quit_action(&self, _sender: Option<&AnyObject>) {
             NSApplication::sharedApplication(self.mtm()).terminate(None);
+        }
+
+        #[unsafe(method(runSearch:))]
+        fn run_search_action(&self, _sender: Option<&AnyObject>) {
+            self.run_search();
+        }
+
+        #[unsafe(method(refreshIndexState:))]
+        fn refresh_index_state_action(&self, _timer: Option<&AnyObject>) {
+            self.refresh_index_state();
         }
     }
 );
@@ -191,6 +295,94 @@ impl Delegate {
             "everyfile event=quick_search_interactive elapsed_us={}",
             started.elapsed().as_micros()
         );
+    }
+
+    fn start_initial_index(&self) {
+        let Some(root) = configured_root() else {
+            return;
+        };
+        let runtime = Arc::clone(&self.ivars().runtime);
+        runtime.lock().unwrap().state = FileIndexState::Rebuilding { scanned_entries: 0 };
+        let data_directory = default_data_directory();
+        let schedule_result = self
+            .ivars()
+            .scheduler
+            .get()
+            .expect("scheduler initialized")
+            .try_schedule(move || {
+                let progress_runtime = Arc::clone(&runtime);
+                let result = build_first_index_with_progress(
+                    &root,
+                    &data_directory,
+                    move |scanned_entries| {
+                        progress_runtime.lock().unwrap().state =
+                            FileIndexState::Rebuilding { scanned_entries };
+                    },
+                );
+                let mut runtime = runtime.lock().unwrap();
+                match result {
+                    Ok(built) => {
+                        runtime.state = built.state;
+                        runtime.projection = Some(Arc::new(built.projection));
+                        runtime.error = None;
+                    }
+                    Err(error) => {
+                        runtime.state = FileIndexState::NotAvailable;
+                        runtime.error = Some(error);
+                    }
+                }
+            });
+        if let Err(error) = schedule_result {
+            let mut runtime = self.ivars().runtime.lock().unwrap();
+            runtime.state = FileIndexState::NotAvailable;
+            runtime.error = Some(format!("could not schedule initial scan: {error:?}"));
+        }
+    }
+
+    fn refresh_index_state(&self) {
+        let runtime = self.ivars().runtime.lock().unwrap();
+        let title = runtime.state.title();
+        let detail = runtime
+            .error
+            .clone()
+            .unwrap_or_else(|| runtime.state.detail());
+        if let Some(label) = self.ivars().state_title.get() {
+            label.setStringValue(&objc2_foundation::NSString::from_str(title));
+        }
+        if let Some(label) = self.ivars().state_detail.get() {
+            label.setStringValue(&objc2_foundation::NSString::from_str(&detail));
+        }
+        if let Some(item) = self.ivars().status_state_item.get() {
+            item.setTitle(&objc2_foundation::NSString::from_str(title));
+            item.setSubtitle(Some(&objc2_foundation::NSString::from_str(&detail)));
+        }
+        if let Some(button) = self
+            .ivars()
+            .status_item
+            .get()
+            .and_then(|item| item.button(self.mtm()))
+        {
+            button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
+                "Everyfile — {title}"
+            ))));
+        }
+    }
+
+    fn run_search(&self) {
+        let query = self
+            .ivars()
+            .search_field
+            .get()
+            .map(|field| field.stringValue().to_string())
+            .unwrap_or_default();
+        let projection = self.ivars().runtime.lock().unwrap().projection.clone();
+        let results = projection
+            .and_then(|projection| projection.search(&query, 100).ok())
+            .unwrap_or_default();
+        *self.ivars().results.borrow_mut() = results;
+        if let Some(table) = self.ivars().table.get() {
+            table.reloadData();
+        }
     }
 
     fn show_shortcut_settings(&self) {
@@ -299,7 +491,8 @@ unsafe fn install_hot_key_handler(delegate: &Delegate) {
 fn build_search_window(
     mtm: MainThreadMarker,
     snapshot: &AppSnapshot,
-) -> (Retained<NSWindow>, Retained<NSTextField>) {
+    delegate: &Delegate,
+) -> SearchWindowParts {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(760.0, 460.0));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -337,6 +530,10 @@ fn build_search_window(
     search.setPlaceholderString(Some(ns_string!("Search file names and paths")));
     search.setFont(Some(&NSFont::systemFontOfSize(22.0)));
     search.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    unsafe {
+        search.setTarget(Some(delegate));
+        search.setAction(Some(sel!(runSearch:)));
+    }
 
     let table_frame = NSRect::new(NSPoint::new(24.0, 24.0), NSSize::new(712.0, 330.0));
     let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), table_frame);
@@ -347,6 +544,10 @@ fn build_search_window(
     add_table_column(mtm, &table, "path", "Path", 320.0);
     add_table_column(mtm, &table, "modified", "Modified", 120.0);
     add_table_column(mtm, &table, "size", "Size", 80.0);
+    unsafe {
+        table.setDataSource(Some(ProtocolObject::from_ref(delegate)));
+        table.setDelegate(Some(ProtocolObject::from_ref(delegate)));
+    }
 
     let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), table_frame);
     scroll.setDrawsBackground(false);
@@ -369,7 +570,7 @@ fn build_search_window(
     empty_title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
 
     let empty_detail = NSTextField::labelWithString(
-        objc2_foundation::NSString::from_str(snapshot.file_index.detail()).as_ref(),
+        objc2_foundation::NSString::from_str(&snapshot.file_index.detail()).as_ref(),
         mtm,
     );
     empty_detail.setFrame(NSRect::new(
@@ -385,7 +586,13 @@ fn build_search_window(
     effect.addSubview(&empty_title);
     effect.addSubview(&empty_detail);
     window.setContentView(Some(&effect));
-    (window, search)
+    SearchWindowParts {
+        window,
+        search_field: search,
+        table,
+        state_title: empty_title,
+        state_detail: empty_detail,
+    }
 }
 
 fn add_table_column(
@@ -405,7 +612,10 @@ fn add_table_column(
     table.addTableColumn(&column);
 }
 
-fn build_status_item(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSStatusItem> {
+fn build_status_item(
+    mtm: MainThreadMarker,
+    delegate: &Delegate,
+) -> (Retained<NSStatusItem>, Retained<NSMenuItem>) {
     let status_item =
         NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = status_item.button(mtm) {
@@ -456,7 +666,7 @@ fn build_status_item(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSS
         true,
     );
     status_item.setMenu(Some(&menu));
-    status_item
+    (status_item, state)
 }
 
 fn add_menu_item(
