@@ -7,7 +7,7 @@ use crate::model::{Coverage, IndexedEntry, RootCoverage, SkippedLocation};
 use crate::scanner::ScanReport;
 use crate::volume::Volume;
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub struct IndexStore {
     connection: Connection,
@@ -42,6 +42,14 @@ pub struct VolumeConfiguration {
 }
 
 impl IndexStore {
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub fn compact(&self) -> rusqlite::Result<()> {
+        self.connection.execute_batch("VACUUM")
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -67,6 +75,9 @@ impl IndexStore {
             }
         }
         connection.execute_batch(SCHEMA)?;
+        if entries_have_name_column(&connection)? {
+            migrate_entries_to_compact_storage(&connection)?;
+        }
         connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         Ok(Self { connection })
     }
@@ -117,6 +128,135 @@ impl IndexStore {
         self.commit_scan_with_checkpoint(report, coverage, Some((stream_identity, event_id)))
     }
 
+    pub fn commit_scoped_reconciliation(
+        &mut self,
+        root: &Path,
+        scopes: &[PathBuf],
+        observed: &[ScanReport],
+        coverage: Coverage,
+        stream_identity: &str,
+        event_id: u64,
+    ) -> rusqlite::Result<u64> {
+        let (volume_id, previous_generation): (i64, i64) = self.connection.query_row(
+            "SELECT volume_id, generation FROM published_roots WHERE root_path = ?1",
+            [root.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let transaction = self.connection.transaction()?;
+        let next_generation = transaction.query_row(
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM scan_generations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        transaction.execute(
+            "INSERT INTO scan_generations (generation, volume_id, root_path, coverage, committed)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            params![
+                next_generation as i64,
+                volume_id,
+                root.to_string_lossy(),
+                coverage_text(coverage),
+            ],
+        )?;
+        transaction.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS repair_scopes (path TEXT PRIMARY KEY) WITHOUT ROWID;
+             DELETE FROM repair_scopes;",
+        )?;
+        {
+            let mut insert_scope =
+                transaction.prepare_cached("INSERT INTO repair_scopes (path) VALUES (?1)")?;
+            for scope in scopes {
+                insert_scope.execute([scope.to_string_lossy().as_ref()])?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO entries
+             (generation, entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden)
+             SELECT ?1, entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden
+             FROM entries prior
+             WHERE prior.generation = ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM repair_scopes scope
+                   WHERE prior.full_path = scope.path
+                      OR substr(prior.full_path, 1, length(scope.path) + 1) = scope.path || '/'
+               )",
+            params![next_generation as i64, previous_generation],
+        )?;
+        {
+            let mut insert = transaction.prepare_cached(
+                "INSERT OR REPLACE INTO entries
+                 (generation, entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for report in observed {
+                for entry in &report.entries {
+                    insert.execute(params![
+                        next_generation as i64,
+                        entry.entry_id as i64,
+                        entry.volume_id as i64,
+                        entry.path.to_string_lossy(),
+                        entry.kind.as_i64(),
+                        entry.size as i64,
+                        entry.created_ns,
+                        entry.modified_ns,
+                        entry.hidden,
+                    ])?;
+                }
+            }
+        }
+        transaction.execute(
+            "INSERT INTO skipped_locations (generation, path, reason)
+             SELECT ?1, path, reason FROM skipped_locations prior
+             WHERE prior.generation = ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM repair_scopes scope
+                   WHERE prior.path = scope.path
+                      OR substr(prior.path, 1, length(scope.path) + 1) = scope.path || '/'
+               )",
+            params![next_generation as i64, previous_generation],
+        )?;
+        for report in observed {
+            insert_skips(&transaction, next_generation, &report.skipped)?;
+        }
+        transaction.execute(
+            "UPDATE scan_generations SET committed = 1 WHERE generation = ?1",
+            [next_generation as i64],
+        )?;
+        transaction.execute(
+            "UPDATE published_roots SET generation = ?1, coverage = ?2
+             WHERE volume_id = ?3 AND root_path = ?4",
+            params![
+                next_generation as i64,
+                coverage_text(coverage),
+                volume_id,
+                root.to_string_lossy(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO volume_checkpoints
+             (volume_id, root_path, stream_identity, event_id, generation)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(volume_id, root_path) DO UPDATE SET
+                 stream_identity=excluded.stream_identity,
+                 event_id=excluded.event_id,
+                 generation=excluded.generation",
+            params![
+                volume_id,
+                root.to_string_lossy(),
+                stream_identity,
+                event_id as i64,
+                next_generation as i64,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_generations
+             WHERE generation NOT IN (SELECT generation FROM published_roots)",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(next_generation)
+    }
+
     fn commit_scan_with_checkpoint(
         &mut self,
         report: &ScanReport,
@@ -142,21 +282,20 @@ impl IndexStore {
         {
             let mut insert = transaction.prepare_cached(
                 "INSERT INTO entries
-                 (generation, entry_id, volume_id, name, full_path, kind, size, created_ns, modified_ns, hidden)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (generation, entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for entry in &report.entries {
                 insert.execute(params![
                     next_generation as i64,
                     entry.entry_id as i64,
                     entry.volume_id as i64,
-                    entry.name,
                     entry.path.to_string_lossy(),
                     entry.kind.as_i64(),
                     entry.size as i64,
                     entry.created_ns,
                     entry.modified_ns,
-                    entry.hidden
+                    entry.hidden,
                 ])?;
             }
         }
@@ -283,7 +422,7 @@ impl IndexStore {
         let generation = generation as u64;
         let volume_id = volume_id as u64;
         let mut statement = self.connection.prepare(
-            "SELECT entry_id, volume_id, name, full_path, kind, size, created_ns, modified_ns, hidden
+            "SELECT entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden
              FROM entries WHERE generation = ?1 ORDER BY full_path",
         )?;
         let entries = statement
@@ -291,18 +430,18 @@ impl IndexStore {
                 Ok(IndexedEntry {
                     entry_id: row.get::<_, i64>(0)? as u64,
                     volume_id: row.get::<_, i64>(1)? as u64,
-                    name: row.get(2)?,
-                    path: PathBuf::from(row.get::<_, String>(3)?),
-                    kind: match row.get::<_, i64>(4)? {
+                    path: PathBuf::from(row.get::<_, String>(2)?),
+                    name: name_from_path(&row.get::<_, String>(2)?),
+                    kind: match row.get::<_, i64>(3)? {
                         1 => crate::model::EntryKind::File,
                         2 => crate::model::EntryKind::Directory,
                         3 => crate::model::EntryKind::Symlink,
                         _ => crate::model::EntryKind::Other,
                     },
-                    size: row.get::<_, i64>(5)? as u64,
-                    created_ns: row.get(6)?,
-                    modified_ns: row.get(7)?,
-                    hidden: row.get(8)?,
+                    size: row.get::<_, i64>(4)? as u64,
+                    created_ns: row.get(5)?,
+                    modified_ns: row.get(6)?,
+                    hidden: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -383,7 +522,7 @@ impl IndexStore {
         coverage: String,
     ) -> rusqlite::Result<CommittedIndex> {
         let mut statement = self.connection.prepare(
-            "SELECT entry_id, volume_id, name, full_path, kind, size, created_ns, modified_ns, hidden
+            "SELECT entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden
              FROM entries WHERE generation = ?1 ORDER BY full_path",
         )?;
         let entries = statement
@@ -391,18 +530,18 @@ impl IndexStore {
                 Ok(IndexedEntry {
                     entry_id: row.get::<_, i64>(0)? as u64,
                     volume_id: row.get::<_, i64>(1)? as u64,
-                    name: row.get(2)?,
-                    path: PathBuf::from(row.get::<_, String>(3)?),
-                    kind: match row.get::<_, i64>(4)? {
+                    path: PathBuf::from(row.get::<_, String>(2)?),
+                    name: name_from_path(&row.get::<_, String>(2)?),
+                    kind: match row.get::<_, i64>(3)? {
                         1 => crate::model::EntryKind::File,
                         2 => crate::model::EntryKind::Directory,
                         3 => crate::model::EntryKind::Symlink,
                         _ => crate::model::EntryKind::Other,
                     },
-                    size: row.get::<_, i64>(5)? as u64,
-                    created_ns: row.get(6)?,
-                    modified_ns: row.get(7)?,
-                    hidden: row.get(8)?,
+                    size: row.get::<_, i64>(4)? as u64,
+                    created_ns: row.get(5)?,
+                    modified_ns: row.get(6)?,
+                    hidden: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -540,6 +679,51 @@ fn preserve_damaged_database(path: &Path) -> std::io::Result<PathBuf> {
     Ok(damaged)
 }
 
+fn entries_have_name_column(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info(entries)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.iter().any(|column| column == "name"))
+}
+
+fn migrate_entries_to_compact_storage(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         BEGIN IMMEDIATE;
+         DROP INDEX IF EXISTS entries_generation_path;
+         CREATE TABLE entries_compact (
+             generation INTEGER NOT NULL,
+             entry_id INTEGER NOT NULL,
+             volume_id INTEGER NOT NULL,
+             full_path TEXT NOT NULL,
+             kind INTEGER NOT NULL,
+             size INTEGER NOT NULL,
+             created_ns INTEGER,
+             modified_ns INTEGER,
+             hidden INTEGER NOT NULL,
+             PRIMARY KEY (generation, entry_id, full_path)
+         ) WITHOUT ROWID;
+         INSERT INTO entries_compact
+             (generation, entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden)
+         SELECT generation, entry_id, volume_id, full_path, kind, size, created_ns, modified_ns, hidden
+         FROM entries;
+         DROP TABLE entries;
+         ALTER TABLE entries_compact RENAME TO entries;
+         COMMIT;
+         PRAGMA auto_vacuum=FULL;
+         VACUUM;
+         PRAGMA foreign_keys=ON;",
+    )
+}
+
+fn name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn coverage_text(coverage: Coverage) -> &'static str {
     match coverage {
         Coverage::Complete => "complete",
@@ -599,7 +783,6 @@ CREATE TABLE IF NOT EXISTS entries (
     generation INTEGER NOT NULL REFERENCES scan_generations(generation) ON DELETE CASCADE,
     entry_id INTEGER NOT NULL,
     volume_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
     full_path TEXT NOT NULL,
     kind INTEGER NOT NULL,
     size INTEGER NOT NULL,
@@ -607,8 +790,7 @@ CREATE TABLE IF NOT EXISTS entries (
     modified_ns INTEGER,
     hidden INTEGER NOT NULL,
     PRIMARY KEY (generation, entry_id, full_path)
-);
-CREATE INDEX IF NOT EXISTS entries_generation_path ON entries(generation, full_path);
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS skipped_locations (
     generation INTEGER NOT NULL REFERENCES scan_generations(generation) ON DELETE CASCADE,
     path TEXT NOT NULL,
