@@ -7,6 +7,8 @@ use crate::model::{Coverage, IndexedEntry, SkippedLocation};
 use crate::scanner::ScanReport;
 use crate::volume::Volume;
 
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+
 pub struct IndexStore {
     connection: Connection,
 }
@@ -45,11 +47,44 @@ impl IndexStore {
             std::fs::create_dir_all(parent)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
+        let existed = path.exists();
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        if existed {
+            let integrity: String =
+                connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+            if integrity != "ok" {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let version: i64 =
+                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if version > CURRENT_SCHEMA_VERSION {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+        }
         connection.execute_batch(SCHEMA)?;
+        connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         Ok(Self { connection })
+    }
+
+    pub fn open_or_recover(path: &Path) -> Result<(Self, Option<PathBuf>), String> {
+        match Self::open(path) {
+            Ok(store) => Ok((store, None)),
+            Err(original) if path.exists() => {
+                let damaged = preserve_damaged_database(path).map_err(|preserve| {
+                    format!("File Index is damaged ({original}); could not preserve it: {preserve}")
+                })?;
+                Self::open(path)
+                    .map(|store| (store, Some(damaged)))
+                    .map_err(|rebuild| {
+                        format!(
+                            "preserved damaged File Index after {original}, but could not create a replacement: {rebuild}"
+                        )
+                    })
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     pub fn commit_scan(&mut self, report: &ScanReport) -> rusqlite::Result<u64> {
@@ -424,6 +459,40 @@ impl IndexStore {
     }
 }
 
+fn preserve_damaged_database(path: &Path) -> std::io::Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("index");
+    let mut sequence = 0_u32;
+    let damaged = loop {
+        let suffix = if sequence == 0 {
+            format!("damaged-{timestamp}")
+        } else {
+            format!("damaged-{timestamp}-{sequence}")
+        };
+        let candidate = parent.join(format!("{stem}.{suffix}.sqlite3"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        sequence += 1;
+    };
+    std::fs::rename(path, &damaged)?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+        if sidecar.exists() {
+            let preserved = PathBuf::from(format!("{}{suffix}", damaged.display()));
+            std::fs::rename(sidecar, preserved)?;
+        }
+    }
+    Ok(damaged)
+}
+
 fn coverage_text(coverage: Coverage) -> &'static str {
     match coverage {
         Coverage::Complete => "complete",
@@ -535,6 +604,54 @@ mod tests {
         assert_eq!(committed.entries.len(), 1);
         assert_eq!(committed.entries[0].name, "report.txt");
         assert_eq!(committed.coverage, Coverage::Complete);
+    }
+
+    #[test]
+    fn corruption_is_preserved_and_replaced_without_publishing_old_results() {
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        fs::write(&database, b"not a sqlite database").unwrap();
+
+        let (store, archive) = IndexStore::open_or_recover(&database).unwrap();
+        let archive = archive.expect("corruption must be preserved");
+        assert_eq!(fs::read(archive).unwrap(), b"not a sqlite database");
+        assert!(store.latest_committed().unwrap().is_none());
+        assert!(database.exists());
+    }
+
+    #[test]
+    fn incompatible_schema_is_archived_before_a_fresh_index_is_created() {
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        let store = IndexStore::open(&database).unwrap();
+        store
+            .connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(store);
+
+        let (replacement, archive) = IndexStore::open_or_recover(&database).unwrap();
+        assert!(archive.unwrap().exists());
+        assert!(replacement.latest_committed().unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_archive_names_never_overwrite_existing_evidence() {
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        fs::write(&database, b"damaged").unwrap();
+        let occupied_archive = data.path().join(format!(
+            "index.damaged-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        ));
+        fs::create_dir(&occupied_archive).unwrap();
+
+        let (_, archive) = IndexStore::open_or_recover(&database).unwrap();
+        assert!(archive.unwrap().exists());
+        assert!(occupied_archive.is_dir());
     }
 
     #[test]
