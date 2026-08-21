@@ -45,29 +45,27 @@ pub fn build_first_index_with_progress(
         return Err("configured external volume requires explicit opt-in".to_owned());
     }
 
-    if let Some(committed) = store
-        .all_committed()
+    if let Some(summary) = store
+        .committed_root_summary(&canonical_root)
         .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|committed| committed.root == canonical_root)
     {
         let projection_path = data_directory.join("search.projection");
-        let enabled = store
-            .enabled_committed()
+        let expected_generation = store
+            .enabled_projection_generation()
             .map_err(|error| error.to_string())?;
-        let projection = SearchProjection::build_combined(&projection_path, &enabled)
+        let projection = SearchProjection::open(&projection_path, expected_generation)
+            .or_else(|_| {
+                let enabled = store.enabled_committed()?;
+                SearchProjection::build_combined(&projection_path, &enabled)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })
             .map_err(|error| error.to_string())?;
         return Ok(BuiltIndex {
             state: FileIndexState::Current {
-                coverage: committed.coverage,
+                coverage: summary.coverage,
             },
             projection,
-            coverage_report: RootCoverage {
-                volume_id: committed.volume_id,
-                root: committed.root,
-                coverage: committed.coverage,
-                skipped: committed.skipped,
-            },
+            coverage_report: summary,
             recovery_archive,
         });
     }
