@@ -13,7 +13,7 @@ use crate::query::{
 };
 
 const MAGIC: &[u8; 8] = b"EVFLIDX\0";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const HEADER_LEN: usize = 24;
 
 pub struct SearchProjection {
@@ -76,6 +76,7 @@ impl SearchProjection {
             file.write_all(&(path.len() as u32).to_le_bytes())?;
             file.write_all(&(normalized_name.len() as u32).to_le_bytes())?;
             file.write_all(&(normalized_path.len() as u32).to_le_bytes())?;
+            file.write_all(&[u8::from(entry.hidden)])?;
             file.write_all(name)?;
             file.write_all(path)?;
             file.write_all(normalized_name.as_bytes())?;
@@ -143,6 +144,18 @@ impl SearchProjection {
         sort: SortOrder,
         cancellation: &CancellationToken,
     ) -> io::Result<RankedResults> {
+        self.search_ranked_with_visibility(query, recent_opens, limit, sort, cancellation, true)
+    }
+
+    pub fn search_ranked_with_visibility(
+        &self,
+        query: &str,
+        recent_opens: &HashMap<u64, u64>,
+        limit: usize,
+        sort: SortOrder,
+        cancellation: &CancellationToken,
+        show_hidden: bool,
+    ) -> io::Result<RankedResults> {
         let candidates = ProjectionCandidates {
             map: &self.map,
             remaining: self.record_count,
@@ -150,7 +163,7 @@ impl SearchProjection {
         };
         Ok(rank_candidates_with_options(
             query,
-            candidates,
+            candidates.filter(|candidate| show_hidden || !candidate.hidden),
             recent_opens,
             limit,
             sort,
@@ -183,7 +196,8 @@ impl Iterator for ProjectionCandidates<'_> {
             read_u32(self.map, offset + 40).expect("projection was validated") as usize;
         let normalized_path_len =
             read_u32(self.map, offset + 44).expect("projection was validated") as usize;
-        let mut cursor = offset + 48;
+        let hidden = self.map[offset + 48] != 0;
+        let mut cursor = offset + 49;
         let name = read_str(self.map, cursor, name_len).expect("projection was validated");
         cursor += name_len;
         let path = read_str(self.map, cursor, path_len).expect("projection was validated");
@@ -207,6 +221,7 @@ impl Iterator for ProjectionCandidates<'_> {
             },
             normalized_name: normalized_name.to_owned(),
             normalized_path: normalized_path.to_owned(),
+            hidden,
         })
     }
 }
@@ -223,7 +238,7 @@ fn validate_records(map: &[u8], count: u32) -> io::Result<()> {
         let normalized_name_len = read_u32(map, offset + 40)? as usize;
         let normalized_path_len = read_u32(map, offset + 44)? as usize;
         offset = offset
-            .checked_add(48)
+            .checked_add(49)
             .and_then(|value| value.checked_add(name_len))
             .and_then(|value| value.checked_add(path_len))
             .and_then(|value| value.checked_add(normalized_name_len))
@@ -340,5 +355,44 @@ mod tests {
                 .unwrap();
         assert_eq!(projection.search("internal.txt", 100).unwrap().len(), 1);
         assert_eq!(projection.search("external.txt", 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hidden_visibility_and_unicode_normalization_are_query_options() {
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join(".secret-café.txt"), "hidden").unwrap();
+        fs::write(fixture.path().join("cafe\u{301}.txt"), "decomposed").unwrap();
+        let data = tempdir().unwrap();
+        let mut store = IndexStore::open(&data.path().join("index.sqlite3")).unwrap();
+        store
+            .commit_scan(&scan_root(fixture.path()).unwrap())
+            .unwrap();
+        let committed = store.latest_committed().unwrap().unwrap();
+        let projection =
+            SearchProjection::build(&data.path().join("search.projection"), &committed).unwrap();
+
+        let shown = projection
+            .search_ranked_with_visibility(
+                "café",
+                &HashMap::new(),
+                100,
+                SortOrder::default(),
+                &CancellationToken::default(),
+                true,
+            )
+            .unwrap();
+        let hidden = projection
+            .search_ranked_with_visibility(
+                "café",
+                &HashMap::new(),
+                100,
+                SortOrder::default(),
+                &CancellationToken::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(shown.rows.len(), 2);
+        assert_eq!(hidden.rows.len(), 1);
+        assert_eq!(hidden.rows[0].name, "cafe\u{301}.txt");
     }
 }

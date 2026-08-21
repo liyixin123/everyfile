@@ -11,8 +11,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSApplication,
-    NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertThirdButtonReturn,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSColor, NSControl, NSControlTextEditingDelegate, NSEventModifierFlags,
     NSFloatingWindowLevel, NSFont, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
     NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
@@ -128,6 +128,7 @@ struct AppDelegateIvars {
         RefCell<HashMap<String, crossbeam_channel::Receiver<crate::reconciliation::EventBatch>>>,
     external_state_initialized: Cell<bool>,
     coalescing_preset: Cell<CoalescingPreset>,
+    show_hidden: Cell<bool>,
 }
 
 struct RuntimeIndex {
@@ -196,6 +197,7 @@ impl Default for AppDelegateIvars {
             external_event_receivers: RefCell::new(HashMap::new()),
             external_state_initialized: Cell::new(false),
             coalescing_preset: Cell::new(CoalescingPreset::Balanced),
+            show_hidden: Cell::new(true),
         }
     }
 }
@@ -221,6 +223,7 @@ define_class!(
             app.setMainMenu(Some(&build_main_menu(mtm, self)));
             self.restore_sort_order();
             self.restore_coalescing_preset();
+            self.restore_hidden_default();
             self.ivars()
                 .scheduler
                 .set(BackgroundScheduler::new(2, 64))
@@ -477,6 +480,13 @@ define_class!(
         #[unsafe(method(showExternalVolumes:))]
         fn show_external_volumes_action(&self, _sender: Option<&AnyObject>) {
             self.show_external_volumes();
+        }
+
+        #[unsafe(method(toggleHiddenResults:))]
+        fn toggle_hidden_results_action(&self, _sender: Option<&AnyObject>) {
+            self.ivars().show_hidden.set(!self.ivars().show_hidden.get());
+            self.ivars().requested_limit.set(100);
+            self.run_search();
         }
 
         #[unsafe(method(workspaceVolumesChanged:))]
@@ -820,6 +830,7 @@ impl Delegate {
         let Some(projection) = projection else { return };
         let runtime = Arc::clone(&self.ivars().runtime);
         let sort = self.ivars().sort.get();
+        let show_hidden = self.ivars().show_hidden.get();
         let limit = self.ivars().requested_limit.get();
         let _ = self
             .ivars()
@@ -827,9 +838,14 @@ impl Delegate {
             .get()
             .expect("scheduler initialized")
             .try_schedule(move || {
-                if let Ok(ranked) =
-                    projection.search_ranked(&query, &recent_opens, limit, sort, &cancellation)
-                    && !ranked.cancelled
+                if let Ok(ranked) = projection.search_ranked_with_visibility(
+                    &query,
+                    &recent_opens,
+                    limit,
+                    sort,
+                    &cancellation,
+                    show_hidden,
+                ) && !ranked.cancelled
                 {
                     runtime.lock().unwrap().pending_query = Some(QueryPublication {
                         generation,
@@ -898,6 +914,12 @@ impl Delegate {
             _ => CoalescingPreset::Balanced,
         };
         self.ivars().coalescing_preset.set(preset);
+    }
+
+    fn restore_hidden_default(&self) {
+        let value = NSUserDefaults::standardUserDefaults()
+            .integerForKey(ns_string!("EveryfileHiddenDefault"));
+        self.ivars().show_hidden.set(value != 1);
     }
 
     fn select_coalescing_preset(&self, preset: CoalescingPreset) {
@@ -1258,12 +1280,27 @@ impl Delegate {
         let alert = NSAlert::new(self.mtm());
         alert.setMessageText(ns_string!("Global Shortcut"));
         alert.setInformativeText(ns_string!(
-            "Choose the shortcut used to open Everyfile. The selection is saved for future launches."
+            "Choose the global shortcut, or change whether hidden entries are shown by default. Settings are saved for future launches."
         ));
         alert.addButtonWithTitle(ns_string!("⌘⌥Space"));
         alert.addButtonWithTitle(ns_string!("⌘⇧Space"));
+        alert.addButtonWithTitle(if self.ivars().show_hidden.get() {
+            ns_string!("Hide Hidden by Default")
+        } else {
+            ns_string!("Show Hidden by Default")
+        });
         alert.addButtonWithTitle(ns_string!("Cancel"));
         let response = alert.runModal();
+        if response == NSAlertThirdButtonReturn {
+            let show_hidden = !self.ivars().show_hidden.get();
+            self.ivars().show_hidden.set(show_hidden);
+            NSUserDefaults::standardUserDefaults().setInteger_forKey(
+                if show_hidden { 2 } else { 1 },
+                ns_string!("EveryfileHiddenDefault"),
+            );
+            self.run_search();
+            return;
+        }
         let preset = if response == NSAlertFirstButtonReturn {
             Some(1)
         } else if response == NSAlertSecondButtonReturn {
@@ -1655,6 +1692,17 @@ fn build_main_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMen
         ns_string!("c"),
         true,
     );
+    let hidden_item = add_menu_item(
+        mtm,
+        &edit_menu,
+        delegate,
+        ns_string!("Temporarily Toggle Hidden Results"),
+        sel!(toggleHiddenResults:),
+        ns_string!("."),
+        true,
+    );
+    hidden_item
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
     add_menu_item(
         mtm,
         &edit_menu,

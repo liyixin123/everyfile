@@ -23,6 +23,7 @@ pub struct QueryCandidate {
     pub result: SearchResult,
     pub normalized_name: String,
     pub normalized_path: String,
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -354,6 +355,7 @@ mod tests {
             },
             normalized_name: normalize_search_text(name),
             normalized_path: normalize_search_text(path),
+            hidden: false,
         }
     }
 
