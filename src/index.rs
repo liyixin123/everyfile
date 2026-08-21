@@ -42,7 +42,7 @@ impl IndexStore {
     }
 
     pub fn commit_scan(&mut self, report: &ScanReport) -> rusqlite::Result<u64> {
-        self.commit_scan_with_checkpoint(report, None)
+        self.commit_scan_with_checkpoint(report, report.coverage(), None)
     }
 
     pub fn commit_reconciliation(
@@ -51,12 +51,27 @@ impl IndexStore {
         stream_identity: &str,
         event_id: u64,
     ) -> rusqlite::Result<u64> {
-        self.commit_scan_with_checkpoint(report, Some((stream_identity, event_id)))
+        self.commit_scan_with_checkpoint(
+            report,
+            report.coverage(),
+            Some((stream_identity, event_id)),
+        )
+    }
+
+    pub fn commit_reconciliation_with_coverage(
+        &mut self,
+        report: &ScanReport,
+        coverage: Coverage,
+        stream_identity: &str,
+        event_id: u64,
+    ) -> rusqlite::Result<u64> {
+        self.commit_scan_with_checkpoint(report, coverage, Some((stream_identity, event_id)))
     }
 
     fn commit_scan_with_checkpoint(
         &mut self,
         report: &ScanReport,
+        coverage: Coverage,
         checkpoint: Option<(&str, u64)>,
     ) -> rusqlite::Result<u64> {
         let transaction = self.connection.transaction()?;
@@ -72,7 +87,7 @@ impl IndexStore {
                 next_generation as i64,
                 report.volume_id as i64,
                 report.root.to_string_lossy(),
-                coverage_text(report.coverage())
+                coverage_text(coverage)
             ],
         )?;
         {
@@ -111,7 +126,7 @@ impl IndexStore {
                 report.volume_id as i64,
                 report.root.to_string_lossy(),
                 next_generation as i64,
-                coverage_text(report.coverage())
+                coverage_text(coverage)
             ],
         )?;
         if let Some((stream_identity, event_id)) = checkpoint {
