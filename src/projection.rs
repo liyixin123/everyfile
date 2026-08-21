@@ -7,10 +7,13 @@ use memmap2::{Mmap, MmapOptions};
 
 use crate::index::CommittedIndex;
 use crate::model::SearchResult;
-use crate::query::{QueryCandidate, normalize_search_text, rank_candidates};
+use crate::query::{
+    CancellationToken, QueryCandidate, RankedResults, SortOrder, normalize_search_text,
+    rank_candidates_with_options,
+};
 
 const MAGIC: &[u8; 8] = b"EVFLIDX\0";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_LEN: usize = 24;
 
 pub struct SearchProjection {
@@ -38,6 +41,7 @@ impl SearchProjection {
             let normalized_path = normalize_search_text(&entry.path.to_string_lossy());
             file.write_all(&entry.entry_id.to_le_bytes())?;
             file.write_all(&entry.size.to_le_bytes())?;
+            file.write_all(&entry.created_ns.unwrap_or(i64::MIN).to_le_bytes())?;
             file.write_all(&entry.modified_ns.unwrap_or(i64::MIN).to_le_bytes())?;
             file.write_all(&(name.len() as u32).to_le_bytes())?;
             file.write_all(&(path.len() as u32).to_le_bytes())?;
@@ -91,38 +95,90 @@ impl SearchProjection {
         recent_opens: &HashMap<u64, u64>,
         limit: usize,
     ) -> io::Result<Vec<SearchResult>> {
-        let mut candidates = Vec::with_capacity(self.record_count as usize);
-        let mut offset = HEADER_LEN;
-        for _ in 0..self.record_count {
-            let entry_id = read_u64(&self.map, offset)?;
-            let size = read_u64(&self.map, offset + 8)?;
-            let raw_modified = read_i64(&self.map, offset + 16)?;
-            let name_len = read_u32(&self.map, offset + 24)? as usize;
-            let path_len = read_u32(&self.map, offset + 28)? as usize;
-            let normalized_name_len = read_u32(&self.map, offset + 32)? as usize;
-            let normalized_path_len = read_u32(&self.map, offset + 36)? as usize;
-            offset += 40;
-            let name = read_str(&self.map, offset, name_len)?;
-            offset += name_len;
-            let path = read_str(&self.map, offset, path_len)?;
-            offset += path_len;
-            let normalized_name = read_str(&self.map, offset, normalized_name_len)?;
-            offset += normalized_name_len;
-            let normalized_path = read_str(&self.map, offset, normalized_path_len)?;
-            offset += normalized_path_len;
-            candidates.push(QueryCandidate {
-                result: SearchResult {
-                    entry_id,
-                    name: name.to_owned(),
-                    path: PathBuf::from(path),
-                    size,
-                    modified_ns: (raw_modified != i64::MIN).then_some(raw_modified),
-                },
-                normalized_name: normalized_name.to_owned(),
-                normalized_path: normalized_path.to_owned(),
-            });
+        Ok(self
+            .search_ranked(
+                query,
+                recent_opens,
+                limit,
+                SortOrder::default(),
+                &CancellationToken::default(),
+            )?
+            .rows)
+    }
+
+    pub fn search_ranked(
+        &self,
+        query: &str,
+        recent_opens: &HashMap<u64, u64>,
+        limit: usize,
+        sort: SortOrder,
+        cancellation: &CancellationToken,
+    ) -> io::Result<RankedResults> {
+        let candidates = ProjectionCandidates {
+            map: &self.map,
+            remaining: self.record_count,
+            offset: HEADER_LEN,
+        };
+        Ok(rank_candidates_with_options(
+            query,
+            candidates,
+            recent_opens,
+            limit,
+            sort,
+            cancellation,
+        ))
+    }
+}
+
+struct ProjectionCandidates<'a> {
+    map: &'a [u8],
+    remaining: u32,
+    offset: usize,
+}
+
+impl Iterator for ProjectionCandidates<'_> {
+    type Item = QueryCandidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
         }
-        Ok(rank_candidates(query, candidates, recent_opens, limit))
+        let offset = self.offset;
+        let entry_id = read_u64(self.map, offset).expect("projection was validated");
+        let size = read_u64(self.map, offset + 8).expect("projection was validated");
+        let raw_created = read_i64(self.map, offset + 16).expect("projection was validated");
+        let raw_modified = read_i64(self.map, offset + 24).expect("projection was validated");
+        let name_len = read_u32(self.map, offset + 32).expect("projection was validated") as usize;
+        let path_len = read_u32(self.map, offset + 36).expect("projection was validated") as usize;
+        let normalized_name_len =
+            read_u32(self.map, offset + 40).expect("projection was validated") as usize;
+        let normalized_path_len =
+            read_u32(self.map, offset + 44).expect("projection was validated") as usize;
+        let mut cursor = offset + 48;
+        let name = read_str(self.map, cursor, name_len).expect("projection was validated");
+        cursor += name_len;
+        let path = read_str(self.map, cursor, path_len).expect("projection was validated");
+        cursor += path_len;
+        let normalized_name =
+            read_str(self.map, cursor, normalized_name_len).expect("projection was validated");
+        cursor += normalized_name_len;
+        let normalized_path =
+            read_str(self.map, cursor, normalized_path_len).expect("projection was validated");
+        cursor += normalized_path_len;
+        self.offset = cursor;
+        self.remaining -= 1;
+        Some(QueryCandidate {
+            result: SearchResult {
+                entry_id,
+                name: name.to_owned(),
+                path: PathBuf::from(path),
+                size,
+                created_ns: (raw_created != i64::MIN).then_some(raw_created),
+                modified_ns: (raw_modified != i64::MIN).then_some(raw_modified),
+            },
+            normalized_name: normalized_name.to_owned(),
+            normalized_path: normalized_path.to_owned(),
+        })
     }
 }
 
@@ -133,12 +189,12 @@ fn temporary_sibling(path: &Path) -> PathBuf {
 fn validate_records(map: &[u8], count: u32) -> io::Result<()> {
     let mut offset = HEADER_LEN;
     for _ in 0..count {
-        let name_len = read_u32(map, offset + 24)? as usize;
-        let path_len = read_u32(map, offset + 28)? as usize;
-        let normalized_name_len = read_u32(map, offset + 32)? as usize;
-        let normalized_path_len = read_u32(map, offset + 36)? as usize;
+        let name_len = read_u32(map, offset + 32)? as usize;
+        let path_len = read_u32(map, offset + 36)? as usize;
+        let normalized_name_len = read_u32(map, offset + 40)? as usize;
+        let normalized_path_len = read_u32(map, offset + 44)? as usize;
         offset = offset
-            .checked_add(40)
+            .checked_add(48)
             .and_then(|value| value.checked_add(name_len))
             .and_then(|value| value.checked_add(path_len))
             .and_then(|value| value.checked_add(normalized_name_len))
