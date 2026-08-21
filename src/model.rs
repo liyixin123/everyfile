@@ -82,6 +82,7 @@ pub struct SearchResult {
     pub name: String,
     pub path: PathBuf,
     pub size: u64,
+    pub created_ns: Option<i64>,
     pub modified_ns: Option<i64>,
 }
 

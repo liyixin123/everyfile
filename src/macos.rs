@@ -32,6 +32,7 @@ use crate::coordinator::{
 use crate::index::IndexStore;
 use crate::model::{AppSnapshot, FileIndexState, SearchResult};
 use crate::projection::SearchProjection;
+use crate::query::{CancellationToken, SortDirection, SortField, SortOrder};
 use crate::scheduler::BackgroundScheduler;
 
 const hot_key_signature: u32 = u32::from_be_bytes(*b"EvFl");
@@ -102,6 +103,11 @@ struct AppDelegateIvars {
     results: RefCell<Vec<SearchResult>>,
     hot_key: Cell<EventHotKeyRef>,
     launch: Instant,
+    sort: Cell<SortOrder>,
+    query_generation: Cell<u64>,
+    query_cancellation: RefCell<CancellationToken>,
+    requested_limit: Cell<usize>,
+    exact_total: Cell<usize>,
 }
 
 struct RuntimeIndex {
@@ -109,6 +115,13 @@ struct RuntimeIndex {
     projection: Option<Arc<SearchProjection>>,
     error: Option<String>,
     recent_opens: HashMap<u64, u64>,
+    pending_query: Option<QueryPublication>,
+}
+
+struct QueryPublication {
+    generation: u64,
+    rows: Vec<SearchResult>,
+    exact_total: usize,
 }
 
 struct SearchWindowParts {
@@ -135,10 +148,16 @@ impl Default for AppDelegateIvars {
                 projection: None,
                 error: None,
                 recent_opens: HashMap::new(),
+                pending_query: None,
             })),
             results: RefCell::new(Vec::new()),
             hot_key: Cell::new(ptr::null_mut()),
             launch: Instant::now(),
+            sort: Cell::new(SortOrder::default()),
+            query_generation: Cell::new(0),
+            query_cancellation: RefCell::new(CancellationToken::default()),
+            requested_limit: Cell::new(100),
+            exact_total: Cell::new(0),
         }
     }
 }
@@ -162,6 +181,7 @@ define_class!(
 
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             app.setMainMenu(Some(&build_main_menu(mtm, self)));
+            self.restore_sort_order();
             self.ivars()
                 .scheduler
                 .set(BackgroundScheduler::new(2, 64))
@@ -222,6 +242,7 @@ define_class!(
     unsafe impl NSControlTextEditingDelegate for Delegate {
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, _notification: &NSNotification) {
+            self.ivars().requested_limit.set(100);
             self.run_search();
         }
 
@@ -254,6 +275,30 @@ define_class!(
     unsafe impl NSTextFieldDelegate for Delegate {}
 
     unsafe impl NSTableViewDelegate for Delegate {
+        #[unsafe(method(tableView:didClickTableColumn:))]
+        fn did_click_table_column(&self, _table: &NSTableView, column: &NSTableColumn) {
+            let field = match column.identifier().to_string().as_str() {
+                "name" => SortField::FileName,
+                "path" => SortField::FullPath,
+                "modified" => SortField::ModificationTime,
+                "created" => SortField::CreationTime,
+                "size" => SortField::FileSize,
+                _ => return,
+            };
+            self.select_sort(field);
+        }
+
+        #[unsafe(method(tableViewSelectionDidChange:))]
+        fn selection_did_change(&self, _notification: &NSNotification) {
+            let Some(table) = self.ivars().table.get() else { return };
+            let selected = usize::try_from(table.selectedRow()).unwrap_or(0);
+            let current = self.ivars().results.borrow().len();
+            if current < self.ivars().exact_total.get() && selected.saturating_add(20) >= current {
+                self.ivars().requested_limit.set(current.saturating_add(100));
+                self.run_search();
+            }
+        }
+
         #[unsafe(method_id(tableView:viewForTableColumn:row:))]
         fn table_view(
             &self,
@@ -270,6 +315,10 @@ define_class!(
                 "path" => result.path.to_string_lossy().into_owned(),
                 "modified" => result
                     .modified_ns
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                "created" => result
+                    .created_ns
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
                 "size" => result.size.to_string(),
@@ -317,6 +366,16 @@ define_class!(
         #[unsafe(method(copySelectedPath:))]
         fn copy_selected_path_action(&self, _sender: Option<&AnyObject>) {
             self.dispatch_selected(ResultAction::CopyPath);
+        }
+
+        #[unsafe(method(sortByRelevance:))]
+        fn sort_by_relevance_action(&self, _sender: Option<&AnyObject>) {
+            self.select_sort(SortField::Relevance);
+        }
+
+        #[unsafe(method(sortByCreationTime:))]
+        fn sort_by_creation_time_action(&self, _sender: Option<&AnyObject>) {
+            self.select_sort(SortField::CreationTime);
         }
     }
 );
@@ -393,7 +452,16 @@ impl Delegate {
     }
 
     fn refresh_index_state(&self) {
-        let runtime = self.ivars().runtime.lock().unwrap();
+        let mut runtime = self.ivars().runtime.lock().unwrap();
+        if let Some(publication) = runtime.pending_query.take()
+            && publication.generation == self.ivars().query_generation.get()
+        {
+            *self.ivars().results.borrow_mut() = publication.rows;
+            self.ivars().exact_total.set(publication.exact_total);
+            if let Some(table) = self.ivars().table.get() {
+                table.reloadData();
+            }
+        }
         let title = runtime.state.title();
         let detail = runtime
             .error
@@ -428,21 +496,86 @@ impl Delegate {
             .get()
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
+        self.ivars().query_cancellation.borrow().cancel();
+        let cancellation = CancellationToken::default();
+        *self.ivars().query_cancellation.borrow_mut() = cancellation.clone();
+        let generation = self.ivars().query_generation.get().wrapping_add(1);
+        self.ivars().query_generation.set(generation);
         let runtime = self.ivars().runtime.lock().unwrap();
         let projection = runtime.projection.clone();
         let recent_opens = runtime.recent_opens.clone();
         drop(runtime);
-        let results = projection
-            .and_then(|projection| {
-                projection
-                    .search_with_history(&query, &recent_opens, 100)
-                    .ok()
-            })
-            .unwrap_or_default();
-        *self.ivars().results.borrow_mut() = results;
-        if let Some(table) = self.ivars().table.get() {
-            table.reloadData();
-        }
+        let Some(projection) = projection else { return };
+        let runtime = Arc::clone(&self.ivars().runtime);
+        let sort = self.ivars().sort.get();
+        let limit = self.ivars().requested_limit.get();
+        let _ = self
+            .ivars()
+            .scheduler
+            .get()
+            .expect("scheduler initialized")
+            .try_schedule(move || {
+                if let Ok(ranked) =
+                    projection.search_ranked(&query, &recent_opens, limit, sort, &cancellation)
+                    && !ranked.cancelled
+                {
+                    runtime.lock().unwrap().pending_query = Some(QueryPublication {
+                        generation,
+                        rows: ranked.rows,
+                        exact_total: ranked.exact_total,
+                    });
+                }
+            });
+    }
+
+    fn select_sort(&self, field: SortField) {
+        let current = self.ivars().sort.get();
+        let direction = if current.field == field {
+            match current.direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            }
+        } else {
+            SortDirection::Ascending
+        };
+        let sort = SortOrder { field, direction };
+        self.ivars().sort.set(sort);
+        self.ivars().requested_limit.set(100);
+        self.persist_sort_order(sort);
+        self.run_search();
+    }
+
+    fn restore_sort_order(&self) {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let field = match defaults.integerForKey(ns_string!("EveryfileSortField")) {
+            1 => SortField::ModificationTime,
+            2 => SortField::CreationTime,
+            3 => SortField::FileName,
+            4 => SortField::FullPath,
+            5 => SortField::FileSize,
+            _ => SortField::Relevance,
+        };
+        let direction = if defaults.integerForKey(ns_string!("EveryfileSortDirection")) == 1 {
+            SortDirection::Descending
+        } else {
+            SortDirection::Ascending
+        };
+        self.ivars().sort.set(SortOrder { field, direction });
+    }
+
+    fn persist_sort_order(&self, sort: SortOrder) {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let field = match sort.field {
+            SortField::Relevance => 0,
+            SortField::ModificationTime => 1,
+            SortField::CreationTime => 2,
+            SortField::FileName => 3,
+            SortField::FullPath => 4,
+            SortField::FileSize => 5,
+        };
+        let direction = usize::from(sort.direction == SortDirection::Descending);
+        defaults.setInteger_forKey(field, ns_string!("EveryfileSortField"));
+        defaults.setInteger_forKey(direction as isize, ns_string!("EveryfileSortDirection"));
     }
 
     fn dispatch_selected(&self, action: ResultAction) -> bool {
@@ -667,10 +800,11 @@ fn build_search_window(
     table.setRowHeight(24.0);
     table.setUsesAlternatingRowBackgroundColors(false);
     table.setBackgroundColor(&NSColor::clearColor());
-    add_table_column(mtm, &table, "name", "Name", 180.0);
-    add_table_column(mtm, &table, "path", "Path", 320.0);
-    add_table_column(mtm, &table, "modified", "Modified", 120.0);
-    add_table_column(mtm, &table, "size", "Size", 80.0);
+    add_table_column(mtm, &table, "name", "Name", 150.0);
+    add_table_column(mtm, &table, "path", "Path", 260.0);
+    add_table_column(mtm, &table, "modified", "Modified", 100.0);
+    add_table_column(mtm, &table, "created", "Created", 100.0);
+    add_table_column(mtm, &table, "size", "Size", 70.0);
     unsafe {
         table.setDataSource(Some(ProtocolObject::from_ref(delegate)));
         table.setDelegate(Some(ProtocolObject::from_ref(delegate)));
@@ -788,6 +922,24 @@ fn build_status_item(
         delegate,
         ns_string!("Clear Open History"),
         sel!(clearOpenHistory:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Sort by Relevance"),
+        sel!(sortByRelevance:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Sort by Creation Time"),
+        sel!(sortByCreationTime:),
         ns_string!(""),
         true,
     );

@@ -34,6 +34,7 @@ mod tests {
             name: "report.txt".into(),
             path: PathBuf::from("/tmp/report.txt"),
             size: 0,
+            created_ns: None,
             modified_ns: None,
         };
         let mut dispatcher = RecordingDispatcher::default();
