@@ -51,9 +51,15 @@ pub fn build_first_index_with_progress(
 
     let report =
         scan_root_with_progress(&canonical_root, progress).map_err(|error| error.to_string())?;
-    store
-        .commit_scan(&report)
-        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    let commit = store.commit_reconciliation(
+        &report,
+        &format!("dev:{}", report.volume_id),
+        crate::fsevents::current_event_id(),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let commit = store.commit_scan(&report);
+    commit.map_err(|error| error.to_string())?;
     let committed = store
         .latest_committed()
         .map_err(|error| error.to_string())?

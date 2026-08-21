@@ -39,6 +39,14 @@ pub enum Coverage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Freshness {
+    Current,
+    CatchingUp,
+    Rebuilding,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
     File,
     Directory,

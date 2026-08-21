@@ -30,10 +30,14 @@ use crate::coordinator::{
     build_first_index_with_progress, configured_root, default_data_directory,
 };
 use crate::index::IndexStore;
-use crate::model::{AppSnapshot, FileIndexState, SearchResult};
+use crate::model::{AppSnapshot, FileIndexState, Freshness, SearchResult};
 use crate::projection::SearchProjection;
 use crate::query::{CancellationToken, SortDirection, SortField, SortOrder};
 use crate::scheduler::BackgroundScheduler;
+use crate::{
+    fsevents::EventSource,
+    reconciliation::{CoalescingPreset, HintCoalescer, reconcile_committed_root},
+};
 
 const hot_key_signature: u32 = u32::from_be_bytes(*b"EvFl");
 const hot_key_id: u32 = 1;
@@ -108,6 +112,10 @@ struct AppDelegateIvars {
     query_cancellation: RefCell<CancellationToken>,
     requested_limit: Cell<usize>,
     exact_total: Cell<usize>,
+    event_source: RefCell<Option<EventSource>>,
+    event_receiver: RefCell<Option<crossbeam_channel::Receiver<crate::reconciliation::EventBatch>>>,
+    event_hints: RefCell<HintCoalescer>,
+    coalescing_preset: Cell<CoalescingPreset>,
 }
 
 struct RuntimeIndex {
@@ -116,6 +124,9 @@ struct RuntimeIndex {
     error: Option<String>,
     recent_opens: HashMap<u64, u64>,
     pending_query: Option<QueryPublication>,
+    freshness: Freshness,
+    reconciliation_in_flight: bool,
+    query_refresh_needed: bool,
 }
 
 struct QueryPublication {
@@ -149,6 +160,9 @@ impl Default for AppDelegateIvars {
                 error: None,
                 recent_opens: HashMap::new(),
                 pending_query: None,
+                freshness: Freshness::Rebuilding,
+                reconciliation_in_flight: false,
+                query_refresh_needed: false,
             })),
             results: RefCell::new(Vec::new()),
             hot_key: Cell::new(ptr::null_mut()),
@@ -158,6 +172,10 @@ impl Default for AppDelegateIvars {
             query_cancellation: RefCell::new(CancellationToken::default()),
             requested_limit: Cell::new(100),
             exact_total: Cell::new(0),
+            event_source: RefCell::new(None),
+            event_receiver: RefCell::new(None),
+            event_hints: RefCell::new(HintCoalescer::default()),
+            coalescing_preset: Cell::new(CoalescingPreset::Balanced),
         }
     }
 }
@@ -182,6 +200,7 @@ define_class!(
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             app.setMainMenu(Some(&build_main_menu(mtm, self)));
             self.restore_sort_order();
+            self.restore_coalescing_preset();
             self.ivars()
                 .scheduler
                 .set(BackgroundScheduler::new(2, 64))
@@ -377,6 +396,21 @@ define_class!(
         fn sort_by_creation_time_action(&self, _sender: Option<&AnyObject>) {
             self.select_sort(SortField::CreationTime);
         }
+
+        #[unsafe(method(useResponsiveIndexing:))]
+        fn use_responsive_indexing_action(&self, _sender: Option<&AnyObject>) {
+            self.select_coalescing_preset(CoalescingPreset::Responsive);
+        }
+
+        #[unsafe(method(useBalancedIndexing:))]
+        fn use_balanced_indexing_action(&self, _sender: Option<&AnyObject>) {
+            self.select_coalescing_preset(CoalescingPreset::Balanced);
+        }
+
+        #[unsafe(method(useLowEnergyIndexing:))]
+        fn use_low_energy_indexing_action(&self, _sender: Option<&AnyObject>) {
+            self.select_coalescing_preset(CoalescingPreset::LowEnergy);
+        }
     }
 );
 
@@ -437,10 +471,13 @@ impl Delegate {
                         runtime.projection = Some(Arc::new(built.projection));
                         runtime.error = None;
                         runtime.recent_opens = recent_opens;
+                        runtime.freshness = Freshness::Current;
+                        runtime.query_refresh_needed = true;
                     }
                     Err(error) => {
                         runtime.state = FileIndexState::NotAvailable;
                         runtime.error = Some(error);
+                        runtime.freshness = Freshness::Rebuilding;
                     }
                 }
             });
@@ -452,6 +489,8 @@ impl Delegate {
     }
 
     fn refresh_index_state(&self) {
+        self.start_fsevents_if_ready();
+        self.poll_fsevents();
         let mut runtime = self.ivars().runtime.lock().unwrap();
         if let Some(publication) = runtime.pending_query.take()
             && publication.generation == self.ivars().query_generation.get()
@@ -462,11 +501,18 @@ impl Delegate {
                 table.reloadData();
             }
         }
-        let title = runtime.state.title();
-        let detail = runtime
-            .error
-            .clone()
-            .unwrap_or_else(|| runtime.state.detail());
+        let title = match runtime.freshness {
+            Freshness::CatchingUp => "File Index: Catching Up",
+            Freshness::Offline => "File Index: Offline",
+            _ => runtime.state.title(),
+        };
+        let detail = runtime.error.clone().unwrap_or_else(|| {
+            if runtime.freshness == Freshness::CatchingUp {
+                "Applying pending filesystem changes to the committed File Index…".into()
+            } else {
+                runtime.state.detail()
+            }
+        });
         if let Some(label) = self.ivars().state_title.get() {
             label.setStringValue(&objc2_foundation::NSString::from_str(title));
         }
@@ -486,6 +532,111 @@ impl Delegate {
             button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
                 "Everyfile — {title}"
             ))));
+        }
+        let refresh_query = runtime.query_refresh_needed;
+        runtime.query_refresh_needed = false;
+        drop(runtime);
+        if refresh_query {
+            self.run_search();
+        }
+    }
+
+    fn start_fsevents_if_ready(&self) {
+        if self.ivars().event_source.borrow().is_some() {
+            return;
+        }
+        let ready = self.ivars().runtime.lock().unwrap().projection.is_some();
+        if !ready {
+            return;
+        }
+        let Some(root) = configured_root().and_then(|root| root.canonicalize().ok()) else {
+            return;
+        };
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::metadata(&root) else {
+            return;
+        };
+        let volume_id = metadata.dev();
+        let identity = format!("dev:{volume_id}");
+        let checkpoint = IndexStore::open(&default_data_directory().join("index.sqlite3"))
+            .ok()
+            .and_then(|store| store.checkpoint(volume_id, &root).ok().flatten())
+            .filter(|checkpoint| checkpoint.stream_identity == identity)
+            .map(|checkpoint| checkpoint.event_id);
+        match EventSource::start(
+            &root,
+            identity,
+            checkpoint,
+            self.ivars().coalescing_preset.get().window().as_secs_f64(),
+        ) {
+            Ok((source, receiver)) => {
+                *self.ivars().event_receiver.borrow_mut() = Some(receiver);
+                *self.ivars().event_source.borrow_mut() = Some(source);
+            }
+            Err(error) => self.ivars().runtime.lock().unwrap().error = Some(error),
+        }
+    }
+
+    fn poll_fsevents(&self) {
+        let batches: Vec<_> = self
+            .ivars()
+            .event_receiver
+            .borrow()
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect())
+            .unwrap_or_default();
+        for batch in batches {
+            self.ivars().event_hints.borrow_mut().push(batch);
+        }
+        if !self.ivars().event_hints.borrow().has_pending() {
+            return;
+        }
+        {
+            let mut runtime = self.ivars().runtime.lock().unwrap();
+            if runtime.reconciliation_in_flight {
+                return;
+            }
+            runtime.reconciliation_in_flight = true;
+            runtime.freshness = Freshness::CatchingUp;
+        }
+        let Some(batch) = self.ivars().event_hints.borrow_mut().take() else {
+            return;
+        };
+        let Some(root) = configured_root().and_then(|root| root.canonicalize().ok()) else {
+            return;
+        };
+        let data_directory = default_data_directory();
+        let runtime = Arc::clone(&self.ivars().runtime);
+        let scheduled = self
+            .ivars()
+            .scheduler
+            .get()
+            .expect("scheduler initialized")
+            .try_schedule(move || {
+                let result = reconcile_committed_root(&root, &data_directory, &batch);
+                let mut runtime = runtime.lock().unwrap();
+                runtime.reconciliation_in_flight = false;
+                match result {
+                    Ok(reconciled) => {
+                        runtime.state = FileIndexState::Current {
+                            coverage: reconciled.coverage,
+                        };
+                        runtime.projection = Some(Arc::new(reconciled.projection));
+                        runtime.freshness = Freshness::Current;
+                        runtime.error = None;
+                        runtime.query_refresh_needed = true;
+                    }
+                    Err(error) => {
+                        runtime.freshness = Freshness::CatchingUp;
+                        runtime.error = Some(error);
+                    }
+                }
+            });
+        if scheduled.is_err() {
+            let mut runtime = self.ivars().runtime.lock().unwrap();
+            runtime.reconciliation_in_flight = false;
+            runtime.freshness = Freshness::CatchingUp;
+            runtime.error = Some("could not schedule FSEvents reconciliation".into());
         }
     }
 
@@ -576,6 +727,30 @@ impl Delegate {
         let direction = usize::from(sort.direction == SortDirection::Descending);
         defaults.setInteger_forKey(field, ns_string!("EveryfileSortField"));
         defaults.setInteger_forKey(direction as isize, ns_string!("EveryfileSortDirection"));
+    }
+
+    fn restore_coalescing_preset(&self) {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let preset = match defaults.integerForKey(ns_string!("EveryfileCoalescingPreset")) {
+            0 => CoalescingPreset::Responsive,
+            2 => CoalescingPreset::LowEnergy,
+            _ => CoalescingPreset::Balanced,
+        };
+        self.ivars().coalescing_preset.set(preset);
+    }
+
+    fn select_coalescing_preset(&self, preset: CoalescingPreset) {
+        self.ivars().coalescing_preset.set(preset);
+        let value = match preset {
+            CoalescingPreset::Responsive => 0,
+            CoalescingPreset::Balanced => 1,
+            CoalescingPreset::LowEnergy => 2,
+        };
+        NSUserDefaults::standardUserDefaults()
+            .setInteger_forKey(value, ns_string!("EveryfileCoalescingPreset"));
+        self.ivars().event_receiver.borrow_mut().take();
+        self.ivars().event_source.borrow_mut().take();
+        self.start_fsevents_if_ready();
     }
 
     fn dispatch_selected(&self, action: ResultAction) -> bool {
@@ -940,6 +1115,34 @@ fn build_status_item(
         delegate,
         ns_string!("Sort by Creation Time"),
         sel!(sortByCreationTime:),
+        ns_string!(""),
+        true,
+    );
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Indexing: Responsive (~1 s)"),
+        sel!(useResponsiveIndexing:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Indexing: Balanced (~5 s)"),
+        sel!(useBalancedIndexing:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Indexing: Low Energy (~15 s)"),
+        sel!(useLowEnergyIndexing:),
         ns_string!(""),
         true,
     );
