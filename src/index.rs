@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::SystemTime};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::model::{Coverage, IndexedEntry, SkippedLocation};
+use crate::model::{Coverage, IndexedEntry, RootCoverage, SkippedLocation};
 use crate::scanner::ScanReport;
 use crate::volume::Volume;
 
@@ -49,6 +49,9 @@ impl IndexStore {
         }
         let existed = path.exists();
         let connection = Connection::open(path)?;
+        if !existed {
+            connection.pragma_update(None, "auto_vacuum", "FULL")?;
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         if existed {
@@ -193,6 +196,11 @@ impl IndexStore {
                 ],
             )?;
         }
+        transaction.execute(
+            "DELETE FROM scan_generations
+             WHERE generation NOT IN (SELECT generation FROM published_roots)",
+            [],
+        )?;
         transaction.commit()?;
         Ok(next_generation)
     }
@@ -218,6 +226,45 @@ impl IndexStore {
                 },
             )
             .optional()
+    }
+
+    pub fn committed_root_summary(&self, root: &Path) -> rusqlite::Result<Option<RootCoverage>> {
+        self.connection
+            .query_row(
+                "SELECT volume_id, generation, coverage FROM published_roots WHERE root_path = ?1",
+                [root.to_string_lossy().as_ref()],
+                |row| {
+                    let volume_id = row.get::<_, i64>(0)? as u64;
+                    let generation = row.get::<_, i64>(1)? as u64;
+                    let coverage = parse_coverage(&row.get::<_, String>(2)?)?;
+                    let skipped = load_skips(&self.connection, generation)?;
+                    Ok(RootCoverage {
+                        volume_id,
+                        root: root.to_path_buf(),
+                        coverage,
+                        skipped,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn enabled_projection_generation(&self) -> rusqlite::Result<Option<u64>> {
+        self.connection.query_row(
+            "SELECT MAX(published.generation)
+             FROM published_roots published
+             JOIN volume_checkpoints checkpoint
+               ON checkpoint.volume_id = published.volume_id
+              AND checkpoint.root_path = published.root_path
+             JOIN volume_configurations configuration
+               ON configuration.identity = checkpoint.stream_identity
+             WHERE configuration.enabled = 1",
+            [],
+            |row| {
+                row.get::<_, Option<i64>>(0)
+                    .map(|value| value.map(|value| value as u64))
+            },
+        )
     }
 
     pub fn latest_committed(&self) -> rusqlite::Result<Option<CommittedIndex>> {
@@ -516,6 +563,28 @@ fn insert_skips(
         ])?;
     }
     Ok(())
+}
+
+fn parse_coverage(value: &str) -> rusqlite::Result<Coverage> {
+    match value {
+        "complete" => Ok(Coverage::Complete),
+        "partial" => Ok(Coverage::Partial),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn load_skips(connection: &Connection, generation: u64) -> rusqlite::Result<Vec<SkippedLocation>> {
+    let mut statement = connection.prepare(
+        "SELECT path, reason FROM skipped_locations WHERE generation = ?1 ORDER BY path",
+    )?;
+    statement
+        .query_map([generation as i64], |row| {
+            Ok(SkippedLocation {
+                path: PathBuf::from(row.get::<_, String>(0)?),
+                reason: row.get(1)?,
+            })
+        })?
+        .collect()
 }
 
 const SCHEMA: &str = "
