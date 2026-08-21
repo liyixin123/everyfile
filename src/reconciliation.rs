@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::index::{IndexStore, VolumeCheckpoint};
-use crate::model::Coverage;
+use crate::model::{Coverage, RootCoverage};
 use crate::projection::SearchProjection;
 use crate::scanner::{ScanReport, scan_root};
 
@@ -168,6 +168,7 @@ pub struct ReconciledIndex {
     pub projection: SearchProjection,
     pub coverage: Coverage,
     pub generation: u64,
+    pub coverage_report: RootCoverage,
 }
 
 pub fn reconcile_committed_root(
@@ -195,6 +196,12 @@ pub fn reconcile_committed_root(
         projection,
         coverage,
         generation,
+        coverage_report: RootCoverage {
+            volume_id: committed.volume_id,
+            root: committed.root,
+            coverage,
+            skipped: committed.skipped,
+        },
     })
 }
 
@@ -234,7 +241,11 @@ fn reconcile_committed_scopes(
         .into_iter()
         .filter(|entry| !scopes.iter().any(|scope| entry.path.starts_with(scope)))
         .collect();
-    let mut skipped = Vec::new();
+    let mut skipped: Vec<_> = committed
+        .skipped
+        .into_iter()
+        .filter(|location| !scopes.iter().any(|scope| location.path.starts_with(scope)))
+        .collect();
     for scope in scopes {
         if !scope.exists() {
             continue;
@@ -276,6 +287,12 @@ fn reconcile_committed_scopes(
         projection,
         coverage,
         generation,
+        coverage_report: RootCoverage {
+            volume_id: committed.volume_id,
+            root: committed.root,
+            coverage,
+            skipped: committed.skipped,
+        },
     })
 }
 
