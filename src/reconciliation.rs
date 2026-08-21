@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::index::{IndexStore, VolumeCheckpoint};
 use crate::model::{Coverage, RootCoverage};
 use crate::projection::SearchProjection;
-use crate::scanner::{ScanReport, scan_root};
+use crate::scanner::scan_root;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CoalescingPreset {
@@ -190,27 +190,21 @@ pub fn reconcile_committed_root(
     let generation = store
         .commit_reconciliation(&report, &batch.stream_identity, batch.highest_event_id)
         .map_err(|error| error.to_string())?;
-    let committed = store
-        .latest_committed()
+    store.compact().map_err(|error| error.to_string())?;
+    drop(report);
+    let summary = store
+        .committed_root_summary(root)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "reconciliation committed without a published generation".to_owned())?;
-    let coverage = committed.coverage;
-    let enabled = store
-        .enabled_committed()
-        .map_err(|error| error.to_string())?;
+    let coverage = summary.coverage;
     let projection =
-        SearchProjection::build_combined(&data_directory.join("search.projection"), &enabled)
+        SearchProjection::build_from_store(&data_directory.join("search.projection"), &store)
             .map_err(|error| error.to_string())?;
     Ok(ReconciledIndex {
         projection,
         coverage,
         generation,
-        coverage_report: RootCoverage {
-            volume_id: committed.volume_id,
-            root: committed.root,
-            coverage,
-            skipped: committed.skipped,
-        },
+        coverage_report: summary,
     })
 }
 
@@ -240,72 +234,50 @@ fn reconcile_committed_scopes(
     }
     let database = data_directory.join("index.sqlite3");
     let mut store = IndexStore::open(&database).map_err(|error| error.to_string())?;
-    let committed = store
-        .latest_committed()
+    let prior = store
+        .committed_root_summary(root)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "subtree repair requires a committed File Index".to_owned())?;
-    let prior_coverage = committed.coverage;
-    let mut entries: Vec<_> = committed
-        .entries
-        .into_iter()
-        .filter(|entry| !scopes.iter().any(|scope| entry.path.starts_with(scope)))
-        .collect();
-    let mut skipped: Vec<_> = committed
-        .skipped
-        .into_iter()
-        .filter(|location| !scopes.iter().any(|scope| location.path.starts_with(scope)))
-        .collect();
+    let mut observed = Vec::new();
     for scope in scopes {
         if !scope.exists() {
             continue;
         }
-        let observed = scan_root(scope).map_err(|error| error.to_string())?;
-        entries.extend(observed.entries);
-        skipped.extend(observed.skipped);
+        observed.push(scan_root(scope).map_err(|error| error.to_string())?);
     }
-    entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    entries.dedup_by(|left, right| left.path == right.path);
-    let report = ScanReport {
-        root: root.to_path_buf(),
-        volume_id: committed.volume_id,
-        entries,
-        skipped,
-    };
-    let coverage = if prior_coverage == Coverage::Partial || report.coverage() == Coverage::Partial
+    let coverage = if prior.coverage == Coverage::Partial
+        || observed
+            .iter()
+            .any(|report| report.coverage() == Coverage::Partial)
     {
         Coverage::Partial
     } else {
         Coverage::Complete
     };
     let generation = store
-        .commit_reconciliation_with_coverage(
-            &report,
+        .commit_scoped_reconciliation(
+            root,
+            scopes,
+            &observed,
             coverage,
             &batch.stream_identity,
             batch.highest_event_id,
         )
         .map_err(|error| error.to_string())?;
-    let committed = store
-        .latest_committed()
+    drop(observed);
+    let summary = store
+        .committed_root_summary(root)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "repair committed without a published generation".to_owned())?;
-    let coverage = committed.coverage;
-    let enabled = store
-        .enabled_committed()
-        .map_err(|error| error.to_string())?;
+    let coverage = summary.coverage;
     let projection =
-        SearchProjection::build_combined(&data_directory.join("search.projection"), &enabled)
+        SearchProjection::build_from_store(&data_directory.join("search.projection"), &store)
             .map_err(|error| error.to_string())?;
     Ok(ReconciledIndex {
         projection,
         coverage,
         generation,
-        coverage_report: RootCoverage {
-            volume_id: committed.volume_id,
-            root: committed.root,
-            coverage,
-            skipped: committed.skipped,
-        },
+        coverage_report: summary,
     })
 }
 

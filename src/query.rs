@@ -26,6 +26,19 @@ pub struct QueryCandidate {
     pub hidden: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BorrowedQueryCandidate<'a> {
+    pub entry_id: u64,
+    pub name: &'a str,
+    pub normalized_name: &'a str,
+    pub parent_path: &'a str,
+    pub normalized_parent_path: &'a str,
+    pub size: u64,
+    pub created_ns: Option<i64>,
+    pub modified_ns: Option<i64>,
+    pub hidden: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RankKey {
     selected: SelectedValue,
@@ -206,6 +219,271 @@ pub fn rank_candidates_with_options(
         max_retained,
         cancelled: false,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BorrowedSelectedValue<'a> {
+    Relevance,
+    OptionalNumber(Option<i64>),
+    Number(u64),
+    Text(&'a str),
+    Path(&'a str, &'a str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BorrowedRankKey<'a> {
+    selected: BorrowedSelectedValue<'a>,
+    direction: SortDirection,
+    class: RelevanceClass,
+    name_term_count: usize,
+    name_len: usize,
+    path_len: usize,
+    recent_open: u64,
+    normalized_name: &'a str,
+    canonical_path: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BorrowedHeapEntry<'a> {
+    key: BorrowedRankKey<'a>,
+    candidate: BorrowedQueryCandidate<'a>,
+}
+
+impl PartialEq for BorrowedHeapEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for BorrowedHeapEntry<'_> {}
+
+impl PartialOrd for BorrowedHeapEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BorrowedHeapEntry<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_borrowed_keys(&self.key, &other.key)
+    }
+}
+
+pub fn rank_borrowed_candidates_with_options<'a>(
+    query: &str,
+    candidates: impl IntoIterator<Item = BorrowedQueryCandidate<'a>>,
+    recent_opens: &HashMap<u64, u64>,
+    limit: usize,
+    sort: SortOrder,
+    cancellation: &CancellationToken,
+) -> RankedResults {
+    let terms: Vec<_> = normalize_search_text(query)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+    let mut exact_total = 0;
+    let mut max_retained = 0;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if index % 256 == 0 && cancellation.is_cancelled() {
+            return RankedResults {
+                rows: Vec::new(),
+                exact_total,
+                max_retained,
+                cancelled: true,
+            };
+        }
+        let Some(mut key) = rank_borrowed_candidate(candidate, &terms, recent_opens) else {
+            continue;
+        };
+        exact_total += 1;
+        key.selected = match sort.field {
+            SortField::Relevance => BorrowedSelectedValue::Relevance,
+            SortField::ModificationTime => {
+                BorrowedSelectedValue::OptionalNumber(candidate.modified_ns)
+            }
+            SortField::CreationTime => BorrowedSelectedValue::OptionalNumber(candidate.created_ns),
+            SortField::FileName => BorrowedSelectedValue::Text(candidate.normalized_name),
+            SortField::FullPath => BorrowedSelectedValue::Path(
+                candidate.normalized_parent_path,
+                candidate.normalized_name,
+            ),
+            SortField::FileSize => BorrowedSelectedValue::Number(candidate.size),
+        };
+        key.direction = sort.direction;
+        if limit > 0 {
+            heap.push(BorrowedHeapEntry { key, candidate });
+            if heap.len() > limit {
+                heap.pop();
+            }
+            max_retained = max_retained.max(heap.len());
+        }
+    }
+    if cancellation.is_cancelled() {
+        return RankedResults {
+            rows: Vec::new(),
+            exact_total,
+            max_retained,
+            cancelled: true,
+        };
+    }
+    let mut ranked = heap.into_vec();
+    ranked.sort_unstable_by(|left, right| compare_borrowed_keys(&left.key, &right.key));
+    RankedResults {
+        rows: ranked
+            .into_iter()
+            .map(|entry| SearchResult {
+                entry_id: entry.candidate.entry_id,
+                name: entry.candidate.name.to_owned(),
+                path: std::path::Path::new(entry.candidate.parent_path).join(entry.candidate.name),
+                size: entry.candidate.size,
+                created_ns: entry.candidate.created_ns,
+                modified_ns: entry.candidate.modified_ns,
+            })
+            .collect(),
+        exact_total,
+        max_retained,
+        cancelled: false,
+    }
+}
+
+fn rank_borrowed_candidate<'a>(
+    candidate: BorrowedQueryCandidate<'a>,
+    terms: &[String],
+    recent_opens: &HashMap<u64, u64>,
+) -> Option<BorrowedRankKey<'a>> {
+    if !terms.iter().all(|term| {
+        candidate.normalized_name.contains(term)
+            || candidate.normalized_parent_path.contains(term)
+            || normalized_path_boundary_contains(
+                candidate.normalized_parent_path,
+                candidate.name,
+                term,
+            )
+    }) {
+        return None;
+    }
+    let name_term_count = terms
+        .iter()
+        .filter(|term| candidate.normalized_name.contains(term.as_str()))
+        .count();
+    Some(BorrowedRankKey {
+        selected: BorrowedSelectedValue::Relevance,
+        direction: SortDirection::Ascending,
+        class: classify(candidate.normalized_name, terms, name_term_count),
+        name_term_count,
+        name_len: candidate.normalized_name.chars().count(),
+        path_len: candidate.normalized_parent_path.chars().count()
+            + 1
+            + candidate.name.chars().count(),
+        recent_open: recent_opens
+            .get(&candidate.entry_id)
+            .copied()
+            .unwrap_or_default(),
+        normalized_name: candidate.normalized_name,
+        canonical_path: candidate.normalized_parent_path,
+    })
+}
+
+fn compare_borrowed_keys(left: &BorrowedRankKey<'_>, right: &BorrowedRankKey<'_>) -> Ordering {
+    if !matches!(left.selected, BorrowedSelectedValue::Relevance) {
+        return compare_borrowed_selected(&left.selected, &right.selected, left.direction)
+            .then_with(|| compare_borrowed_relevance(left, right))
+            .then_with(|| normalized_cmp(left.normalized_name, right.normalized_name))
+            .then_with(|| left.canonical_path.cmp(right.canonical_path));
+    }
+    let relevance = compare_borrowed_relevance(left, right);
+    match left.direction {
+        SortDirection::Ascending => relevance,
+        SortDirection::Descending => relevance.reverse(),
+    }
+}
+
+fn compare_borrowed_relevance(left: &BorrowedRankKey<'_>, right: &BorrowedRankKey<'_>) -> Ordering {
+    left.class
+        .cmp(&right.class)
+        .then_with(|| right.name_term_count.cmp(&left.name_term_count))
+        .then_with(|| left.name_len.cmp(&right.name_len))
+        .then_with(|| left.path_len.cmp(&right.path_len))
+        .then_with(|| right.recent_open.cmp(&left.recent_open))
+        .then_with(|| left.canonical_path.cmp(right.canonical_path))
+        .then_with(|| normalized_cmp(left.normalized_name, right.normalized_name))
+}
+
+fn compare_borrowed_selected(
+    left: &BorrowedSelectedValue<'_>,
+    right: &BorrowedSelectedValue<'_>,
+    direction: SortDirection,
+) -> Ordering {
+    let order = match (left, right) {
+        (
+            BorrowedSelectedValue::OptionalNumber(None),
+            BorrowedSelectedValue::OptionalNumber(None),
+        ) => Ordering::Equal,
+        (BorrowedSelectedValue::OptionalNumber(None), _) => return Ordering::Greater,
+        (_, BorrowedSelectedValue::OptionalNumber(None)) => return Ordering::Less,
+        (
+            BorrowedSelectedValue::OptionalNumber(Some(left)),
+            BorrowedSelectedValue::OptionalNumber(Some(right)),
+        ) => left.cmp(right),
+        (BorrowedSelectedValue::Number(left), BorrowedSelectedValue::Number(right)) => {
+            left.cmp(right)
+        }
+        (BorrowedSelectedValue::Text(left), BorrowedSelectedValue::Text(right)) => {
+            normalized_cmp(left, right)
+        }
+        (
+            BorrowedSelectedValue::Path(left_parent, left_name),
+            BorrowedSelectedValue::Path(right_parent, right_name),
+        ) => left_parent
+            .cmp(right_parent)
+            .then_with(|| normalized_cmp(left_name, right_name)),
+        _ => Ordering::Equal,
+    };
+    match direction {
+        SortDirection::Ascending => order,
+        SortDirection::Descending => order.reverse(),
+    }
+}
+
+#[inline]
+fn normalized_contains(value: &str, normalized_term: &str) -> bool {
+    if value.contains(normalized_term) {
+        return true;
+    }
+    if value.is_ascii() && normalized_term.is_ascii() {
+        let needle = normalized_term.as_bytes();
+        if !value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return false;
+        }
+        needle.is_empty()
+            || value
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+    } else {
+        normalize_search_text(value).contains(normalized_term)
+    }
+}
+
+fn normalized_path_boundary_contains(
+    normalized_parent: &str,
+    name: &str,
+    normalized_term: &str,
+) -> bool {
+    if !normalized_term.contains('/') {
+        return false;
+    }
+    if normalized_parent.is_ascii() && name.is_ascii() && normalized_term.is_ascii() {
+        let boundary = format!("{}/{}", normalized_parent, name);
+        normalized_contains(&boundary, normalized_term)
+    } else {
+        normalize_search_text(&format!("{}/{}", normalized_parent, name)).contains(normalized_term)
+    }
+}
+
+fn normalized_cmp(left: &str, right: &str) -> Ordering {
+    left.cmp(right)
 }
 
 fn apply_sort(key: &mut RankKey, result: &SearchResult, sort: SortOrder) {

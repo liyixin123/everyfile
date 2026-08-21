@@ -1312,12 +1312,11 @@ impl Delegate {
             .expect("scheduler initialized")
             .try_schedule(move || {
                 let result = IndexStore::open(&data_directory.join("index.sqlite3"))
-                    .and_then(|store| store.enabled_committed())
                     .map_err(|error| error.to_string())
-                    .and_then(|indexes| {
-                        SearchProjection::build_combined(
+                    .and_then(|store| {
+                        SearchProjection::build_from_store(
                             &data_directory.join("search.projection"),
-                            &indexes,
+                            &store,
                         )
                         .map_err(|error| error.to_string())
                     });

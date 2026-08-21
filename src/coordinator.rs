@@ -54,11 +54,7 @@ pub fn build_first_index_with_progress(
             .enabled_projection_generation()
             .map_err(|error| error.to_string())?;
         let projection = SearchProjection::open(&projection_path, expected_generation)
-            .or_else(|_| {
-                let enabled = store.enabled_committed()?;
-                SearchProjection::build_combined(&projection_path, &enabled)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-            })
+            .or_else(|_| SearchProjection::build_from_store(&projection_path, &store))
             .map_err(|error| error.to_string())?;
         return Ok(BuiltIndex {
             state: FileIndexState::Current {
@@ -81,29 +77,21 @@ pub fn build_first_index_with_progress(
     #[cfg(not(target_os = "macos"))]
     let commit = store.commit_scan(&report);
     commit.map_err(|error| error.to_string())?;
-    let committed = store
-        .all_committed()
+    store.compact().map_err(|error| error.to_string())?;
+    drop(report);
+    let summary = store
+        .committed_root_summary(&canonical_root)
         .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|committed| committed.root == canonical_root)
         .ok_or_else(|| "scan committed without a published generation".to_owned())?;
-    let enabled = store
-        .enabled_committed()
-        .map_err(|error| error.to_string())?;
     let projection =
-        SearchProjection::build_combined(&data_directory.join("search.projection"), &enabled)
+        SearchProjection::build_from_store(&data_directory.join("search.projection"), &store)
             .map_err(|error| error.to_string())?;
     Ok(BuiltIndex {
         state: FileIndexState::Current {
-            coverage: committed.coverage,
+            coverage: summary.coverage,
         },
         projection,
-        coverage_report: RootCoverage {
-            volume_id: committed.volume_id,
-            root: committed.root,
-            coverage: committed.coverage,
-            skipped: committed.skipped,
-        },
+        coverage_report: summary,
         recovery_archive,
     })
 }
