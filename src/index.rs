@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::{Coverage, IndexedEntry, SkippedLocation};
 use crate::scanner::ScanReport;
+use crate::volume::Volume;
 
 pub struct IndexStore {
     connection: Connection,
@@ -27,6 +28,15 @@ pub struct VolumeCheckpoint {
     pub stream_identity: String,
     pub event_id: u64,
     pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeConfiguration {
+    pub identity: String,
+    pub mount_path: PathBuf,
+    pub enabled: bool,
+    pub local: bool,
+    pub internal: bool,
 }
 
 impl IndexStore {
@@ -239,6 +249,106 @@ impl IndexStore {
         }))
     }
 
+    pub fn all_committed(&self) -> rusqlite::Result<Vec<CommittedIndex>> {
+        let mut roots = self.connection.prepare(
+            "SELECT generation, volume_id, root_path, coverage
+             FROM published_roots ORDER BY root_path",
+        )?;
+        let rows = roots
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    PathBuf::from(row.get::<_, String>(2)?),
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(generation, volume_id, root, coverage)| {
+                self.load_committed(generation, volume_id, root, coverage)
+            })
+            .collect()
+    }
+
+    pub fn enabled_committed(&self) -> rusqlite::Result<Vec<CommittedIndex>> {
+        let configurations: HashMap<_, _> = self
+            .volume_configurations()?
+            .into_iter()
+            .map(|configuration| (configuration.identity, configuration.enabled))
+            .collect();
+        self.all_committed().map(|indexes| {
+            indexes
+                .into_iter()
+                .filter(|index| {
+                    self.checkpoint(index.volume_id, &index.root)
+                        .ok()
+                        .flatten()
+                        .and_then(|checkpoint| {
+                            configurations.get(&checkpoint.stream_identity).copied()
+                        })
+                        .unwrap_or(true)
+                })
+                .collect()
+        })
+    }
+
+    fn load_committed(
+        &self,
+        generation: u64,
+        volume_id: u64,
+        root: PathBuf,
+        coverage: String,
+    ) -> rusqlite::Result<CommittedIndex> {
+        let mut statement = self.connection.prepare(
+            "SELECT entry_id, volume_id, name, full_path, kind, size, created_ns, modified_ns, hidden
+             FROM entries WHERE generation = ?1 ORDER BY full_path",
+        )?;
+        let entries = statement
+            .query_map([generation as i64], |row| {
+                Ok(IndexedEntry {
+                    entry_id: row.get::<_, i64>(0)? as u64,
+                    volume_id: row.get::<_, i64>(1)? as u64,
+                    name: row.get(2)?,
+                    path: PathBuf::from(row.get::<_, String>(3)?),
+                    kind: match row.get::<_, i64>(4)? {
+                        1 => crate::model::EntryKind::File,
+                        2 => crate::model::EntryKind::Directory,
+                        3 => crate::model::EntryKind::Symlink,
+                        _ => crate::model::EntryKind::Other,
+                    },
+                    size: row.get::<_, i64>(5)? as u64,
+                    created_ns: row.get(6)?,
+                    modified_ns: row.get(7)?,
+                    hidden: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut skips = self.connection.prepare(
+            "SELECT path, reason FROM skipped_locations WHERE generation=?1 ORDER BY path",
+        )?;
+        let skipped = skips
+            .query_map([generation as i64], |row| {
+                Ok(SkippedLocation {
+                    path: PathBuf::from(row.get::<_, String>(0)?),
+                    reason: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(CommittedIndex {
+            generation,
+            volume_id,
+            root,
+            coverage: if coverage == "complete" {
+                Coverage::Complete
+            } else {
+                Coverage::Partial
+            },
+            entries,
+            skipped,
+        })
+    }
+
     pub fn record_successful_open(&self, entry_id: u64) -> rusqlite::Result<()> {
         let opened_ns = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -267,6 +377,50 @@ impl IndexStore {
     pub fn clear_open_history(&self) -> rusqlite::Result<()> {
         self.connection.execute("DELETE FROM recent_opens", [])?;
         Ok(())
+    }
+
+    pub fn observe_volume(&self, volume: &Volume) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "INSERT INTO volume_configurations (identity, mount_path, enabled, local, internal)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(identity) DO UPDATE SET mount_path=excluded.mount_path,
+                 local=excluded.local, internal=excluded.internal",
+            params![
+                volume.identity,
+                volume.mount_path.to_string_lossy(),
+                volume.enabled_by_default(),
+                volume.local,
+                volume.internal,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_volume_enabled(&self, identity: &str, enabled: bool) -> rusqlite::Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE volume_configurations SET enabled=?2
+             WHERE identity=?1 AND local=1",
+            params![identity, enabled],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn volume_configurations(&self) -> rusqlite::Result<Vec<VolumeConfiguration>> {
+        let mut statement = self.connection.prepare(
+            "SELECT identity, mount_path, enabled, local, internal
+             FROM volume_configurations ORDER BY mount_path",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(VolumeConfiguration {
+                    identity: row.get(0)?,
+                    mount_path: PathBuf::from(row.get::<_, String>(1)?),
+                    enabled: row.get(2)?,
+                    local: row.get(3)?,
+                    internal: row.get(4)?,
+                })
+            })?
+            .collect()
     }
 }
 
@@ -340,6 +494,13 @@ CREATE TABLE IF NOT EXISTS volume_checkpoints (
     event_id INTEGER NOT NULL,
     generation INTEGER NOT NULL REFERENCES scan_generations(generation),
     PRIMARY KEY (volume_id, root_path)
+);
+CREATE TABLE IF NOT EXISTS volume_configurations (
+    identity TEXT PRIMARY KEY,
+    mount_path TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    local INTEGER NOT NULL,
+    internal INTEGER NOT NULL
 );
 ";
 
@@ -516,5 +677,41 @@ mod tests {
         let restored = store.latest_committed().unwrap().unwrap();
         assert_eq!(restored.coverage, Coverage::Complete);
         assert!(restored.skipped.is_empty());
+    }
+
+    #[test]
+    fn external_opt_in_is_explicit_persistent_and_network_stays_off() {
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        let store = IndexStore::open(&database).unwrap();
+        let volume = |identity: &str, local, internal| Volume {
+            id: 1,
+            identity: identity.into(),
+            mount_path: PathBuf::from(format!("/Volumes/{identity}")),
+            filesystem: "apfs".into(),
+            local,
+            internal,
+        };
+        store
+            .observe_volume(&volume("external", true, false))
+            .unwrap();
+        store
+            .observe_volume(&volume("network", false, false))
+            .unwrap();
+        let initial = store.volume_configurations().unwrap();
+        assert!(initial.iter().all(|configuration| !configuration.enabled));
+        assert!(store.set_volume_enabled("external", true).unwrap());
+        assert!(!store.set_volume_enabled("network", true).unwrap());
+        drop(store);
+        let reopened = IndexStore::open(&database).unwrap();
+        assert!(
+            reopened
+                .volume_configurations()
+                .unwrap()
+                .iter()
+                .find(|configuration| configuration.identity == "external")
+                .unwrap()
+                .enabled
+        );
     }
 }

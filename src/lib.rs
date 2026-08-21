@@ -8,6 +8,7 @@ pub mod reconciliation;
 pub mod scanner;
 pub mod scheduler;
 pub mod volume;
+pub mod volume_lifecycle;
 
 #[cfg(target_os = "macos")]
 pub mod fsevents;

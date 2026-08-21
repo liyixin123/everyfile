@@ -18,7 +18,8 @@ use objc2_app_kit::{
     NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
     NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength,
     NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
+    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidMountNotification,
+    NSWorkspaceDidUnmountNotification, NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSTimer,
@@ -36,11 +37,12 @@ use crate::model::{
 use crate::projection::SearchProjection;
 use crate::query::{CancellationToken, SortDirection, SortField, SortOrder};
 use crate::scheduler::BackgroundScheduler;
+use crate::volume::{VolumeKind, discover_mounted_volumes};
 use crate::{
     fsevents::{self, EventSource},
     reconciliation::{
         CoalescingPreset, EventBatch, HintCoalescer, RecoveryPlan, plan_batch, plan_stream_start,
-        reconcile_recovery_plan,
+        reconcile_committed_root, reconcile_recovery_plan,
     },
 };
 
@@ -121,6 +123,10 @@ struct AppDelegateIvars {
     event_source: RefCell<Option<EventSource>>,
     event_receiver: RefCell<Option<crossbeam_channel::Receiver<crate::reconciliation::EventBatch>>>,
     event_hints: RefCell<HintCoalescer>,
+    external_event_sources: RefCell<HashMap<String, EventSource>>,
+    external_event_receivers:
+        RefCell<HashMap<String, crossbeam_channel::Receiver<crate::reconciliation::EventBatch>>>,
+    external_state_initialized: Cell<bool>,
     coalescing_preset: Cell<CoalescingPreset>,
 }
 
@@ -134,6 +140,7 @@ struct RuntimeIndex {
     reconciliation_in_flight: bool,
     query_refresh_needed: bool,
     coverage_reports: Vec<RootCoverage>,
+    offline_external_roots: Vec<std::path::PathBuf>,
 }
 
 struct QueryPublication {
@@ -172,6 +179,7 @@ impl Default for AppDelegateIvars {
                 reconciliation_in_flight: false,
                 query_refresh_needed: false,
                 coverage_reports: Vec::new(),
+                offline_external_roots: Vec::new(),
             })),
             results: RefCell::new(Vec::new()),
             hot_key: Cell::new(ptr::null_mut()),
@@ -184,6 +192,9 @@ impl Default for AppDelegateIvars {
             event_source: RefCell::new(None),
             event_receiver: RefCell::new(None),
             event_hints: RefCell::new(HintCoalescer::default()),
+            external_event_sources: RefCell::new(HashMap::new()),
+            external_event_receivers: RefCell::new(HashMap::new()),
+            external_state_initialized: Cell::new(false),
             coalescing_preset: Cell::new(CoalescingPreset::Balanced),
         }
     }
@@ -244,6 +255,16 @@ define_class!(
                         Some(NSWorkspaceDidWakeNotification),
                         None,
                     );
+                for name in [NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification] {
+                    NSWorkspace::sharedWorkspace()
+                        .notificationCenter()
+                        .addObserver_selector_name_object(
+                            self,
+                            sel!(workspaceVolumesChanged:),
+                            Some(name),
+                            None,
+                        );
+                }
             }
             if !self.register_saved_shortcut() {
                 eprintln!("everyfile event=shortcut_registration_failed preset=saved");
@@ -452,6 +473,16 @@ define_class!(
         fn show_skipped_locations_action(&self, _sender: Option<&AnyObject>) {
             self.show_skipped_locations();
         }
+
+        #[unsafe(method(showExternalVolumes:))]
+        fn show_external_volumes_action(&self, _sender: Option<&AnyObject>) {
+            self.show_external_volumes();
+        }
+
+        #[unsafe(method(workspaceVolumesChanged:))]
+        fn workspace_volumes_changed(&self, _notification: &NSNotification) {
+            self.refresh_external_volume_state();
+        }
     }
 );
 
@@ -532,7 +563,14 @@ impl Delegate {
 
     fn refresh_index_state(&self) {
         self.start_fsevents_if_ready();
+        if !self.ivars().external_state_initialized.get()
+            && self.ivars().runtime.lock().unwrap().projection.is_some()
+        {
+            self.ivars().external_state_initialized.set(true);
+            self.refresh_external_volume_state();
+        }
         self.poll_fsevents();
+        self.poll_external_fsevents();
         let mut runtime = self.ivars().runtime.lock().unwrap();
         if let Some(publication) = runtime.pending_query.take()
             && publication.generation == self.ivars().query_generation.get()
@@ -554,10 +592,11 @@ impl Delegate {
                 "Applying pending filesystem changes to the committed File Index…".into()
             } else if let Some(coverage) = coverage {
                 format!(
-                    "Freshness: {:?} · Coverage: {:?} across {} configured root(s)",
+                    "Freshness: {:?} · Coverage: {:?} across {} configured root(s) · {} external Offline",
                     runtime.freshness,
                     coverage,
-                    runtime.coverage_reports.len()
+                    runtime.coverage_reports.len(),
+                    runtime.offline_external_roots.len()
                 )
             } else {
                 runtime.state.detail()
@@ -943,6 +982,278 @@ impl Delegate {
         alert.runModal();
     }
 
+    fn show_external_volumes(&self) {
+        let Ok(volumes) = discover_mounted_volumes() else {
+            return;
+        };
+        let Some(volume) = volumes
+            .into_iter()
+            .find(|volume| volume.kind() == VolumeKind::ExternalLocal)
+        else {
+            let alert = NSAlert::new(self.mtm());
+            alert.setMessageText(ns_string!("External Volumes"));
+            alert.setInformativeText(ns_string!("No external local volume is currently mounted."));
+            alert.runModal();
+            return;
+        };
+        let database = default_data_directory().join("index.sqlite3");
+        let Ok(store) = IndexStore::open(&database) else {
+            return;
+        };
+        let _ = store.observe_volume(&volume);
+        let enabled = store
+            .volume_configurations()
+            .ok()
+            .and_then(|configs| {
+                configs
+                    .into_iter()
+                    .find(|config| config.identity == volume.identity)
+            })
+            .is_some_and(|config| config.enabled);
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(ns_string!("External Volume"));
+        alert.setInformativeText(&objc2_foundation::NSString::from_str(&format!(
+            "{}\n{}",
+            volume.mount_path.display(),
+            if enabled {
+                "Enabled for indexing"
+            } else {
+                "Not indexed until you explicitly enable it"
+            }
+        )));
+        alert.addButtonWithTitle(if enabled {
+            ns_string!("Disable")
+        } else {
+            ns_string!("Enable")
+        });
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+        if alert.runModal() != NSAlertFirstButtonReturn {
+            return;
+        }
+        if !store
+            .set_volume_enabled(&volume.identity, !enabled)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if enabled {
+            self.ivars()
+                .external_event_sources
+                .borrow_mut()
+                .remove(&volume.identity);
+            self.ivars()
+                .external_event_receivers
+                .borrow_mut()
+                .remove(&volume.identity);
+            self.rebuild_combined_projection();
+        } else {
+            self.start_external_fsevents(volume.identity, volume.mount_path.clone());
+            self.schedule_external_index(volume.mount_path);
+        }
+    }
+
+    fn schedule_external_index(&self, root: std::path::PathBuf) {
+        let runtime = Arc::clone(&self.ivars().runtime);
+        let data_directory = default_data_directory();
+        let _ = self
+            .ivars()
+            .scheduler
+            .get()
+            .expect("scheduler initialized")
+            .try_schedule(move || {
+                let result = build_first_index_with_progress(&root, &data_directory, |_| {});
+                let mut runtime = runtime.lock().unwrap();
+                match result {
+                    Ok(built) => {
+                        runtime.projection = Some(Arc::new(built.projection));
+                        runtime
+                            .coverage_reports
+                            .retain(|report| report.root != built.coverage_report.root);
+                        runtime.coverage_reports.push(built.coverage_report);
+                        runtime.query_refresh_needed = true;
+                    }
+                    Err(error) => runtime.error = Some(error),
+                }
+            });
+    }
+
+    fn start_external_fsevents(&self, identity: String, root: std::path::PathBuf) {
+        if self
+            .ivars()
+            .external_event_sources
+            .borrow()
+            .contains_key(&identity)
+        {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::metadata(&root) else {
+            return;
+        };
+        let checkpoint = IndexStore::open(&default_data_directory().join("index.sqlite3"))
+            .ok()
+            .and_then(|store| store.checkpoint(metadata.dev(), &root).ok().flatten())
+            .filter(|checkpoint| checkpoint.stream_identity == identity)
+            .map(|checkpoint| checkpoint.event_id);
+        if let Ok((source, receiver)) = EventSource::start(
+            &root,
+            identity.clone(),
+            checkpoint,
+            self.ivars().coalescing_preset.get().window().as_secs_f64(),
+        ) {
+            self.ivars()
+                .external_event_sources
+                .borrow_mut()
+                .insert(identity.clone(), source);
+            self.ivars()
+                .external_event_receivers
+                .borrow_mut()
+                .insert(identity, receiver);
+        }
+    }
+
+    fn poll_external_fsevents(&self) {
+        let changed: Vec<_> = self
+            .ivars()
+            .external_event_receivers
+            .borrow()
+            .iter()
+            .filter_map(|(identity, receiver)| {
+                receiver
+                    .try_iter()
+                    .max_by_key(|batch| batch.highest_event_id)
+                    .map(|batch| (identity.clone(), batch))
+            })
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let Ok(store) = IndexStore::open(&default_data_directory().join("index.sqlite3")) else {
+            return;
+        };
+        let Ok(configs) = store.volume_configurations() else {
+            return;
+        };
+        for (identity, batch) in changed {
+            if let Some(config) = configs
+                .iter()
+                .find(|config| config.identity == identity && config.enabled)
+            {
+                self.schedule_external_reconciliation(config.mount_path.clone(), batch);
+            }
+        }
+    }
+
+    fn schedule_external_reconciliation(&self, root: std::path::PathBuf, batch: EventBatch) {
+        let runtime = Arc::clone(&self.ivars().runtime);
+        let data_directory = default_data_directory();
+        let _ = self
+            .ivars()
+            .scheduler
+            .get()
+            .expect("scheduler initialized")
+            .try_schedule(move || {
+                let result = reconcile_committed_root(&root, &data_directory, &batch);
+                let mut runtime = runtime.lock().unwrap();
+                match result {
+                    Ok(reconciled) => {
+                        runtime.projection = Some(Arc::new(reconciled.projection));
+                        runtime
+                            .coverage_reports
+                            .retain(|report| report.root != reconciled.coverage_report.root);
+                        runtime.coverage_reports.push(reconciled.coverage_report);
+                        runtime.error = None;
+                        runtime.query_refresh_needed = true;
+                    }
+                    Err(error) => runtime.error = Some(error),
+                }
+            });
+    }
+
+    fn rebuild_combined_projection(&self) {
+        let runtime = Arc::clone(&self.ivars().runtime);
+        let data_directory = default_data_directory();
+        let _ = self
+            .ivars()
+            .scheduler
+            .get()
+            .expect("scheduler initialized")
+            .try_schedule(move || {
+                let result = IndexStore::open(&data_directory.join("index.sqlite3"))
+                    .and_then(|store| store.enabled_committed())
+                    .map_err(|error| error.to_string())
+                    .and_then(|indexes| {
+                        SearchProjection::build_combined(
+                            &data_directory.join("search.projection"),
+                            &indexes,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                let mut runtime = runtime.lock().unwrap();
+                match result {
+                    Ok(projection) => {
+                        runtime.projection = Some(Arc::new(projection));
+                        runtime.query_refresh_needed = true;
+                    }
+                    Err(error) => runtime.error = Some(error),
+                }
+            });
+    }
+
+    fn refresh_external_volume_state(&self) {
+        let Ok(volumes) = discover_mounted_volumes() else {
+            return;
+        };
+        let Ok(store) = IndexStore::open(&default_data_directory().join("index.sqlite3")) else {
+            return;
+        };
+        for volume in &volumes {
+            let _ = store.observe_volume(volume);
+        }
+        let mounted: std::collections::HashMap<_, _> = volumes
+            .into_iter()
+            .map(|volume| (volume.identity, volume.mount_path))
+            .collect();
+        if let Ok(configs) = store.volume_configurations() {
+            let offline: Vec<_> = configs
+                .iter()
+                .filter(|config| {
+                    config.enabled && !config.internal && !mounted.contains_key(&config.identity)
+                })
+                .map(|config| config.mount_path.clone())
+                .collect();
+            self.ivars().runtime.lock().unwrap().offline_external_roots = offline;
+            for config in configs
+                .into_iter()
+                .filter(|config| config.enabled && !config.internal)
+            {
+                if let Some(path) = mounted.get(&config.identity) {
+                    self.start_external_fsevents(config.identity.clone(), path.clone());
+                    self.schedule_external_reconciliation(
+                        path.clone(),
+                        EventBatch {
+                            stream_identity: config.identity,
+                            highest_event_id: fsevents::current_event_id(),
+                            paths: vec![path.clone()],
+                            history_lost: false,
+                            ids_wrapped: false,
+                            root_changed: false,
+                        },
+                    );
+                } else {
+                    self.ivars()
+                        .external_event_sources
+                        .borrow_mut()
+                        .remove(&config.identity);
+                    self.ivars()
+                        .external_event_receivers
+                        .borrow_mut()
+                        .remove(&config.identity);
+                }
+            }
+        }
+    }
+
     fn show_shortcut_settings(&self) {
         let alert = NSAlert::new(self.mtm());
         alert.setMessageText(ns_string!("Global Shortcut"));
@@ -1266,6 +1577,15 @@ fn build_status_item(
         mtm,
         &menu,
         delegate,
+        ns_string!("External Volumes…"),
+        sel!(showExternalVolumes:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
         ns_string!("Sort by Relevance"),
         sel!(sortByRelevance:),
         ns_string!(""),
@@ -1333,6 +1653,15 @@ fn build_main_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMen
         ns_string!("Copy Path"),
         sel!(copySelectedPath:),
         ns_string!("c"),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &edit_menu,
+        delegate,
+        ns_string!("External Volumes…"),
+        sel!(showExternalVolumes:),
+        ns_string!(""),
         true,
     );
     edit_item.setSubmenu(Some(&edit_menu));

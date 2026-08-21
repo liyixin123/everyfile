@@ -27,20 +27,34 @@ pub fn build_first_index_with_progress(
     let volumes = discover_mounted_volumes().map_err(|error| error.to_string())?;
     let volume = volume_containing(&volumes, &canonical_root)
         .ok_or_else(|| "configured root is not on a discovered volume".to_owned())?;
-    if !volume.internal {
-        return Err("configured root is not on an enabled internal volume".to_owned());
-    }
-
     let mut store = IndexStore::open(&data_directory.join("index.sqlite3"))
         .map_err(|error| error.to_string())?;
-    if let Some(committed) = store
-        .latest_committed()
+    for discovered in &volumes {
+        store
+            .observe_volume(discovered)
+            .map_err(|error| error.to_string())?;
+    }
+    let enabled = store
+        .volume_configurations()
         .map_err(|error| error.to_string())?
-        .filter(|committed| committed.root == canonical_root)
+        .into_iter()
+        .find(|configuration| configuration.identity == volume.identity)
+        .is_some_and(|configuration| configuration.enabled);
+    if !volume.local || !enabled {
+        return Err("configured external volume requires explicit opt-in".to_owned());
+    }
+
+    if let Some(committed) = store
+        .all_committed()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|committed| committed.root == canonical_root)
     {
         let projection_path = data_directory.join("search.projection");
-        let projection = SearchProjection::open(&projection_path, Some(committed.generation))
-            .or_else(|_| SearchProjection::build(&projection_path, &committed))
+        let enabled = store
+            .enabled_committed()
+            .map_err(|error| error.to_string())?;
+        let projection = SearchProjection::build_combined(&projection_path, &enabled)
             .map_err(|error| error.to_string())?;
         return Ok(BuiltIndex {
             state: FileIndexState::Current {
@@ -68,11 +82,17 @@ pub fn build_first_index_with_progress(
     let commit = store.commit_scan(&report);
     commit.map_err(|error| error.to_string())?;
     let committed = store
-        .latest_committed()
+        .all_committed()
         .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|committed| committed.root == canonical_root)
         .ok_or_else(|| "scan committed without a published generation".to_owned())?;
-    let projection = SearchProjection::build(&data_directory.join("search.projection"), &committed)
+    let enabled = store
+        .enabled_committed()
         .map_err(|error| error.to_string())?;
+    let projection =
+        SearchProjection::build_combined(&data_directory.join("search.projection"), &enabled)
+            .map_err(|error| error.to_string())?;
     Ok(BuiltIndex {
         state: FileIndexState::Current {
             coverage: committed.coverage,
