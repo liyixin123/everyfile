@@ -13,7 +13,9 @@ type CFRunLoopRef = *mut c_void;
 
 const FILE_EVENTS: u32 = 0x10;
 const WATCH_ROOT: u32 = 0x04;
-const HISTORY_LOST_FLAGS: u32 = 0x01 | 0x02 | 0x04 | 0x08 | 0x20;
+const HISTORY_LOST_FLAGS: u32 = 0x01 | 0x02 | 0x04;
+const IDS_WRAPPED: u32 = 0x08;
+const ROOT_CHANGED: u32 = 0x20;
 const SINCE_NOW: u64 = u64::MAX;
 
 #[repr(C)]
@@ -104,6 +106,37 @@ pub fn current_event_id() -> u64 {
     unsafe { FSEventsGetCurrentEventId() }
 }
 
+pub fn stream_identity(root: &Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let device = std::fs::metadata(root)
+        .map_err(|error| error.to_string())?
+        .dev() as libc::dev_t;
+    let uuid = unsafe { FSEventsCopyUUIDForDevice(device) };
+    if uuid.is_null() {
+        return Err("FSEvents volume UUID is unavailable".into());
+    }
+    let string = unsafe { CFUUIDCreateString(ptr::null(), uuid) };
+    if string.is_null() {
+        unsafe { CFRelease(uuid) };
+        return Err("could not format FSEvents volume UUID".into());
+    }
+    let length = unsafe { CFStringGetLength(string) };
+    let capacity = unsafe { CFStringGetMaximumSizeForEncoding(length, 0x0800_0100) } + 1;
+    let mut bytes = vec![0_u8; usize::try_from(capacity).map_err(|_| "invalid UUID length")?];
+    let copied =
+        unsafe { CFStringGetCString(string, bytes.as_mut_ptr().cast(), capacity, 0x0800_0100) };
+    unsafe {
+        CFRelease(string);
+        CFRelease(uuid);
+    }
+    if !copied {
+        return Err("could not decode FSEvents volume UUID".into());
+    }
+    CStr::from_bytes_until_nul(&bytes)
+        .map(|value| value.to_string_lossy().into_owned())
+        .map_err(|error| error.to_string())
+}
+
 unsafe extern "C" fn event_callback(
     _stream: FSEventStreamRef,
     info: *mut c_void,
@@ -135,6 +168,8 @@ unsafe extern "C" fn event_callback(
         highest_event_id: ids.iter().copied().max().unwrap_or_default(),
         paths,
         history_lost: flags.iter().any(|flag| flag & HISTORY_LOST_FLAGS != 0),
+        ids_wrapped: flags.iter().any(|flag| flag & IDS_WRAPPED != 0),
+        root_changed: flags.iter().any(|flag| flag & ROOT_CHANGED != 0),
     };
     let _ = callback.sender.send(batch);
 }
@@ -167,10 +202,38 @@ unsafe extern "C" {
     fn FSEventStreamInvalidate(stream: FSEventStreamRef);
     fn FSEventStreamRelease(stream: FSEventStreamRef);
     fn FSEventsGetCurrentEventId() -> u64;
+    fn FSEventsCopyUUIDForDevice(device: libc::dev_t) -> *const c_void;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRunLoopGetMain() -> CFRunLoopRef;
+    fn CFUUIDCreateString(allocator: *const c_void, uuid: *const c_void) -> *const c_void;
+    fn CFStringGetLength(string: *const c_void) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+    fn CFStringGetCString(
+        string: *const c_void,
+        buffer: *mut c_char,
+        buffer_size: isize,
+        encoding: u32,
+    ) -> bool;
+    fn CFRelease(value: *const c_void);
     static kCFRunLoopDefaultMode: *const c_void;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+
+    #[test]
+    fn mounted_root_has_a_persistent_fsevents_uuid() {
+        let identity = stream_identity(Path::new("/")).unwrap();
+        assert!(!identity.is_empty());
+        assert_ne!(
+            identity,
+            format!("dev:{}", std::fs::metadata("/").unwrap().dev())
+        );
+    }
 }

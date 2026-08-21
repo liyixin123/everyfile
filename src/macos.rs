@@ -18,7 +18,7 @@ use objc2_app_kit::{
     NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
     NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength,
     NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSTimer,
@@ -35,8 +35,11 @@ use crate::projection::SearchProjection;
 use crate::query::{CancellationToken, SortDirection, SortField, SortOrder};
 use crate::scheduler::BackgroundScheduler;
 use crate::{
-    fsevents::EventSource,
-    reconciliation::{CoalescingPreset, HintCoalescer, reconcile_committed_root},
+    fsevents::{self, EventSource},
+    reconciliation::{
+        CoalescingPreset, EventBatch, HintCoalescer, RecoveryPlan, plan_batch, plan_stream_start,
+        reconcile_recovery_plan,
+    },
 };
 
 const hot_key_signature: u32 = u32::from_be_bytes(*b"EvFl");
@@ -221,6 +224,16 @@ define_class!(
                 .unwrap();
 
             unsafe { install_hot_key_handler(self) };
+            unsafe {
+                NSWorkspace::sharedWorkspace()
+                    .notificationCenter()
+                    .addObserver_selector_name_object(
+                        self,
+                        sel!(workspaceDidWake:),
+                        Some(NSWorkspaceDidWakeNotification),
+                        None,
+                    );
+            }
             if !self.register_saved_shortcut() {
                 eprintln!("everyfile event=shortcut_registration_failed preset=saved");
             }
@@ -243,6 +256,11 @@ define_class!(
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
+            unsafe {
+                NSWorkspace::sharedWorkspace()
+                    .notificationCenter()
+                    .removeObserver(self);
+            }
             let hot_key = self.ivars().hot_key.replace(ptr::null_mut());
             if !hot_key.is_null() {
                 unsafe { UnregisterEventHotKey(hot_key) };
@@ -411,6 +429,13 @@ define_class!(
         fn use_low_energy_indexing_action(&self, _sender: Option<&AnyObject>) {
             self.select_coalescing_preset(CoalescingPreset::LowEnergy);
         }
+
+        #[unsafe(method(workspaceDidWake:))]
+        fn workspace_did_wake(&self, _notification: &NSNotification) {
+            self.ivars().event_receiver.borrow_mut().take();
+            self.ivars().event_source.borrow_mut().take();
+            self.start_fsevents_if_ready();
+        }
     }
 );
 
@@ -557,21 +582,46 @@ impl Delegate {
             return;
         };
         let volume_id = metadata.dev();
-        let identity = format!("dev:{volume_id}");
-        let checkpoint = IndexStore::open(&default_data_directory().join("index.sqlite3"))
-            .ok()
-            .and_then(|store| store.checkpoint(volume_id, &root).ok().flatten())
-            .filter(|checkpoint| checkpoint.stream_identity == identity)
-            .map(|checkpoint| checkpoint.event_id);
+        let Ok(identity) = fsevents::stream_identity(&root) else {
+            return;
+        };
+        let Some((checkpoint, generation)) =
+            IndexStore::open(&default_data_directory().join("index.sqlite3"))
+                .ok()
+                .and_then(|store| {
+                    let committed = store.latest_committed().ok().flatten()?;
+                    Some((
+                        store.checkpoint(volume_id, &root).ok().flatten(),
+                        committed.generation,
+                    ))
+                })
+        else {
+            return;
+        };
+        let start_plan = plan_stream_start(checkpoint.as_ref(), &identity, generation);
+        let since_event_id = match &start_plan {
+            RecoveryPlan::Replay { since_event_id } => Some(*since_event_id),
+            _ => None,
+        };
         match EventSource::start(
             &root,
-            identity,
-            checkpoint,
+            identity.clone(),
+            since_event_id,
             self.ivars().coalescing_preset.get().window().as_secs_f64(),
         ) {
             Ok((source, receiver)) => {
                 *self.ivars().event_receiver.borrow_mut() = Some(receiver);
                 *self.ivars().event_source.borrow_mut() = Some(source);
+                if !matches!(start_plan, RecoveryPlan::Replay { .. }) {
+                    self.ivars().event_hints.borrow_mut().push(EventBatch {
+                        stream_identity: identity,
+                        highest_event_id: fsevents::current_event_id(),
+                        paths: vec![root],
+                        history_lost: false,
+                        ids_wrapped: false,
+                        root_changed: true,
+                    });
+                }
             }
             Err(error) => self.ivars().runtime.lock().unwrap().error = Some(error),
         }
@@ -599,11 +649,21 @@ impl Delegate {
             runtime.reconciliation_in_flight = true;
             runtime.freshness = Freshness::CatchingUp;
         }
-        let Some(batch) = self.ivars().event_hints.borrow_mut().take() else {
+        let Some(mut batch) = self.ivars().event_hints.borrow_mut().take() else {
             return;
         };
         let Some(root) = configured_root().and_then(|root| root.canonicalize().ok()) else {
             return;
+        };
+        let plan = plan_batch(&root, &batch);
+        let rebuilding = matches!(plan, RecoveryPlan::RebuildVolume { .. });
+        if rebuilding || batch.highest_event_id == 0 {
+            batch.highest_event_id = fsevents::current_event_id();
+        }
+        self.ivars().runtime.lock().unwrap().freshness = if rebuilding {
+            Freshness::Rebuilding
+        } else {
+            Freshness::CatchingUp
         };
         let data_directory = default_data_directory();
         let runtime = Arc::clone(&self.ivars().runtime);
@@ -613,7 +673,7 @@ impl Delegate {
             .get()
             .expect("scheduler initialized")
             .try_schedule(move || {
-                let result = reconcile_committed_root(&root, &data_directory, &batch);
+                let result = reconcile_recovery_plan(&root, &data_directory, &batch, &plan);
                 let mut runtime = runtime.lock().unwrap();
                 runtime.reconciliation_in_flight = false;
                 match result {
@@ -627,7 +687,11 @@ impl Delegate {
                         runtime.query_refresh_needed = true;
                     }
                     Err(error) => {
-                        runtime.freshness = Freshness::CatchingUp;
+                        runtime.freshness = if rebuilding {
+                            Freshness::Rebuilding
+                        } else {
+                            Freshness::CatchingUp
+                        };
                         runtime.error = Some(error);
                     }
                 }
@@ -635,7 +699,11 @@ impl Delegate {
         if scheduled.is_err() {
             let mut runtime = self.ivars().runtime.lock().unwrap();
             runtime.reconciliation_in_flight = false;
-            runtime.freshness = Freshness::CatchingUp;
+            runtime.freshness = if rebuilding {
+                Freshness::Rebuilding
+            } else {
+                Freshness::CatchingUp
+            };
             runtime.error = Some("could not schedule FSEvents reconciliation".into());
         }
     }
