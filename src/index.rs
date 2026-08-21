@@ -17,6 +17,7 @@ pub struct CommittedIndex {
     pub root: PathBuf,
     pub coverage: Coverage,
     pub entries: Vec<IndexedEntry>,
+    pub skipped: Vec<SkippedLocation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +214,17 @@ impl IndexStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut skipped_statement = self.connection.prepare(
+            "SELECT path, reason FROM skipped_locations WHERE generation = ?1 ORDER BY path",
+        )?;
+        let skipped = skipped_statement
+            .query_map([generation as i64], |row| {
+                Ok(SkippedLocation {
+                    path: PathBuf::from(row.get::<_, String>(0)?),
+                    reason: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(Some(CommittedIndex {
             generation,
             volume_id,
@@ -223,6 +235,7 @@ impl IndexStore {
                 Coverage::Partial
             },
             entries,
+            skipped,
         }))
     }
 
@@ -448,5 +461,60 @@ mod tests {
                 .event_id,
             7
         );
+    }
+
+    #[test]
+    fn skipped_locations_survive_restart_with_the_published_generation() {
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("visible.txt"), "visible").unwrap();
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        let mut report = scan_root(fixture.path()).unwrap();
+        report.skipped.push(SkippedLocation {
+            path: fixture.path().join("denied"),
+            reason: "permission denied".into(),
+        });
+        IndexStore::open(&database)
+            .unwrap()
+            .commit_scan(&report)
+            .unwrap();
+
+        let committed = IndexStore::open(&database)
+            .unwrap()
+            .latest_committed()
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.coverage, Coverage::Partial);
+        assert_eq!(committed.skipped, report.skipped);
+        assert_eq!(committed.entries.len(), 1);
+    }
+
+    #[test]
+    fn coverage_and_skips_transition_atomically_in_both_directions() {
+        let fixture = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        let mut store = IndexStore::open(&database).unwrap();
+        let complete = scan_root(fixture.path()).unwrap();
+        store.commit_scan(&complete).unwrap();
+        assert_eq!(
+            store.latest_committed().unwrap().unwrap().coverage,
+            Coverage::Complete
+        );
+
+        let mut partial = scan_root(fixture.path()).unwrap();
+        partial.skipped.push(SkippedLocation {
+            path: fixture.path().join("private"),
+            reason: "denied".into(),
+        });
+        store.commit_scan(&partial).unwrap();
+        let committed = store.latest_committed().unwrap().unwrap();
+        assert_eq!(committed.coverage, Coverage::Partial);
+        assert_eq!(committed.skipped.len(), 1);
+
+        store.commit_scan(&complete).unwrap();
+        let restored = store.latest_committed().unwrap().unwrap();
+        assert_eq!(restored.coverage, Coverage::Complete);
+        assert!(restored.skipped.is_empty());
     }
 }

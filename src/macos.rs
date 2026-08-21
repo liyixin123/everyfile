@@ -30,7 +30,9 @@ use crate::coordinator::{
     build_first_index_with_progress, configured_root, default_data_directory,
 };
 use crate::index::IndexStore;
-use crate::model::{AppSnapshot, FileIndexState, Freshness, SearchResult};
+use crate::model::{
+    AppSnapshot, Coverage, FileIndexState, Freshness, RootCoverage, SearchResult, overall_coverage,
+};
 use crate::projection::SearchProjection;
 use crate::query::{CancellationToken, SortDirection, SortField, SortOrder};
 use crate::scheduler::BackgroundScheduler;
@@ -105,6 +107,7 @@ struct AppDelegateIvars {
     state_detail: OnceCell<Retained<NSTextField>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
     status_state_item: OnceCell<Retained<NSMenuItem>>,
+    skipped_locations_item: OnceCell<Retained<NSMenuItem>>,
     scheduler: OnceCell<BackgroundScheduler>,
     runtime: Arc<Mutex<RuntimeIndex>>,
     results: RefCell<Vec<SearchResult>>,
@@ -130,6 +133,7 @@ struct RuntimeIndex {
     freshness: Freshness,
     reconciliation_in_flight: bool,
     query_refresh_needed: bool,
+    coverage_reports: Vec<RootCoverage>,
 }
 
 struct QueryPublication {
@@ -156,6 +160,7 @@ impl Default for AppDelegateIvars {
             state_detail: OnceCell::new(),
             status_item: OnceCell::new(),
             status_state_item: OnceCell::new(),
+            skipped_locations_item: OnceCell::new(),
             scheduler: OnceCell::new(),
             runtime: Arc::new(Mutex::new(RuntimeIndex {
                 state: FileIndexState::NotAvailable,
@@ -166,6 +171,7 @@ impl Default for AppDelegateIvars {
                 freshness: Freshness::Rebuilding,
                 reconciliation_in_flight: false,
                 query_refresh_needed: false,
+                coverage_reports: Vec::new(),
             })),
             results: RefCell::new(Vec::new()),
             hot_key: Cell::new(ptr::null_mut()),
@@ -216,11 +222,16 @@ define_class!(
             self.ivars().table.set(parts.table).unwrap();
             self.ivars().state_title.set(parts.state_title).unwrap();
             self.ivars().state_detail.set(parts.state_detail).unwrap();
-            let (status_item, status_state_item) = build_status_item(mtm, self);
+            let (status_item, status_state_item, skipped_locations_item) =
+                build_status_item(mtm, self);
             self.ivars().status_item.set(status_item).unwrap();
             self.ivars()
                 .status_state_item
                 .set(status_state_item)
+                .unwrap();
+            self.ivars()
+                .skipped_locations_item
+                .set(skipped_locations_item)
                 .unwrap();
 
             unsafe { install_hot_key_handler(self) };
@@ -436,6 +447,11 @@ define_class!(
             self.ivars().event_source.borrow_mut().take();
             self.start_fsevents_if_ready();
         }
+
+        #[unsafe(method(showSkippedLocations:))]
+        fn show_skipped_locations_action(&self, _sender: Option<&AnyObject>) {
+            self.show_skipped_locations();
+        }
     }
 );
 
@@ -498,6 +514,7 @@ impl Delegate {
                         runtime.recent_opens = recent_opens;
                         runtime.freshness = Freshness::Current;
                         runtime.query_refresh_needed = true;
+                        runtime.coverage_reports = vec![built.coverage_report];
                     }
                     Err(error) => {
                         runtime.state = FileIndexState::NotAvailable;
@@ -531,9 +548,17 @@ impl Delegate {
             Freshness::Offline => "File Index: Offline",
             _ => runtime.state.title(),
         };
+        let coverage = overall_coverage(&runtime.coverage_reports);
         let detail = runtime.error.clone().unwrap_or_else(|| {
             if runtime.freshness == Freshness::CatchingUp {
                 "Applying pending filesystem changes to the committed File Index…".into()
+            } else if let Some(coverage) = coverage {
+                format!(
+                    "Freshness: {:?} · Coverage: {:?} across {} configured root(s)",
+                    runtime.freshness,
+                    coverage,
+                    runtime.coverage_reports.len()
+                )
             } else {
                 runtime.state.detail()
             }
@@ -545,8 +570,36 @@ impl Delegate {
             label.setStringValue(&objc2_foundation::NSString::from_str(&detail));
         }
         if let Some(item) = self.ivars().status_state_item.get() {
-            item.setTitle(&objc2_foundation::NSString::from_str(title));
-            item.setSubtitle(Some(&objc2_foundation::NSString::from_str(&detail)));
+            let coverage_title = match coverage {
+                Some(Coverage::Complete) => "Overall Coverage: Complete",
+                Some(Coverage::Partial) => "Overall Coverage: Partial",
+                None => "Overall Coverage: Not Available",
+            };
+            item.setTitle(&objc2_foundation::NSString::from_str(coverage_title));
+            let root_detail = runtime
+                .coverage_reports
+                .first()
+                .map(|report| {
+                    format!(
+                        "{} — {:?} ({} skipped)",
+                        report.root.display(),
+                        report.coverage,
+                        report.skipped.len()
+                    )
+                })
+                .unwrap_or_else(|| detail.clone());
+            item.setSubtitle(Some(&objc2_foundation::NSString::from_str(&root_detail)));
+        }
+        if let Some(item) = self.ivars().skipped_locations_item.get() {
+            let skipped_count: usize = runtime
+                .coverage_reports
+                .iter()
+                .map(|report| report.skipped.len())
+                .sum();
+            item.setTitle(&objc2_foundation::NSString::from_str(&format!(
+                "Skipped Locations… ({skipped_count})"
+            )));
+            item.setEnabled(skipped_count > 0);
         }
         if let Some(button) = self
             .ivars()
@@ -685,6 +738,7 @@ impl Delegate {
                         runtime.freshness = Freshness::Current;
                         runtime.error = None;
                         runtime.query_refresh_needed = true;
+                        runtime.coverage_reports = vec![reconciled.coverage_report];
                     }
                     Err(error) => {
                         runtime.freshness = if rebuilding {
@@ -860,6 +914,33 @@ impl Delegate {
         }
         self.ivars().runtime.lock().unwrap().recent_opens.clear();
         self.run_search();
+    }
+
+    fn show_skipped_locations(&self) {
+        let reports = self
+            .ivars()
+            .runtime
+            .lock()
+            .unwrap()
+            .coverage_reports
+            .clone();
+        let mut lines = Vec::new();
+        for report in reports {
+            for location in report.skipped {
+                lines.push(format!(
+                    "{}\n  {}",
+                    location.path.display(),
+                    location.reason
+                ));
+            }
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(ns_string!("Skipped Locations"));
+        alert.setInformativeText(&objc2_foundation::NSString::from_str(&lines.join("\n\n")));
+        alert.runModal();
     }
 
     fn show_shortcut_settings(&self) {
@@ -1119,7 +1200,11 @@ fn add_table_column(
 fn build_status_item(
     mtm: MainThreadMarker,
     delegate: &Delegate,
-) -> (Retained<NSStatusItem>, Retained<NSMenuItem>) {
+) -> (
+    Retained<NSStatusItem>,
+    Retained<NSMenuItem>,
+    Retained<NSMenuItem>,
+) {
     let status_item =
         NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = status_item.button(mtm) {
@@ -1149,6 +1234,15 @@ fn build_status_item(
     state.setSubtitle(Some(ns_string!(
         "Coverage and Freshness are not available yet"
     )));
+    let skipped_locations = add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Skipped Locations… (0)"),
+        sel!(showSkippedLocations:),
+        ns_string!(""),
+        false,
+    );
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_menu_item(
         mtm,
@@ -1225,7 +1319,7 @@ fn build_status_item(
         true,
     );
     status_item.setMenu(Some(&menu));
-    (status_item, state)
+    (status_item, state, skipped_locations)
 }
 
 fn build_main_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMenu> {

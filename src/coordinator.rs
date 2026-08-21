@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::index::IndexStore;
-use crate::model::{Coverage, FileIndexState};
+use crate::model::{Coverage, FileIndexState, RootCoverage};
 use crate::projection::SearchProjection;
 use crate::scanner::scan_root_with_progress;
 use crate::volume::{discover_mounted_volumes, volume_containing};
@@ -9,6 +9,7 @@ use crate::volume::{discover_mounted_volumes, volume_containing};
 pub struct BuiltIndex {
     pub state: FileIndexState,
     pub projection: SearchProjection,
+    pub coverage_report: RootCoverage,
 }
 
 pub fn build_first_index(root: &Path, data_directory: &Path) -> Result<BuiltIndex, String> {
@@ -46,6 +47,12 @@ pub fn build_first_index_with_progress(
                 coverage: committed.coverage,
             },
             projection,
+            coverage_report: RootCoverage {
+                volume_id: committed.volume_id,
+                root: committed.root,
+                coverage: committed.coverage,
+                skipped: committed.skipped,
+            },
         });
     }
 
@@ -71,6 +78,12 @@ pub fn build_first_index_with_progress(
             coverage: committed.coverage,
         },
         projection,
+        coverage_report: RootCoverage {
+            volume_id: committed.volume_id,
+            root: committed.root,
+            coverage: committed.coverage,
+            skipped: committed.skipped,
+        },
     })
 }
 

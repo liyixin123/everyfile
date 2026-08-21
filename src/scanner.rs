@@ -29,7 +29,21 @@ pub fn scan_root(root: &Path) -> std::io::Result<ScanReport> {
 
 pub fn scan_root_with_progress(
     root: &Path,
+    progress: impl FnMut(u64),
+) -> std::io::Result<ScanReport> {
+    scan_root_with_policy(root, progress, |_, _| None)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanOperation {
+    Enumerate,
+    Metadata,
+}
+
+fn scan_root_with_policy(
+    root: &Path,
     mut progress: impl FnMut(u64),
+    mut denied: impl FnMut(&Path, ScanOperation) -> Option<std::io::Error>,
 ) -> std::io::Result<ScanReport> {
     let root_metadata = fs::symlink_metadata(root)?;
     let volume_id = root_metadata.dev();
@@ -38,7 +52,9 @@ pub fn scan_root_with_progress(
     let mut pending = VecDeque::from([root.to_path_buf()]);
 
     while let Some(directory) = pending.pop_front() {
-        let children = match fs::read_dir(&directory) {
+        let children = match denied(&directory, ScanOperation::Enumerate)
+            .map_or_else(|| fs::read_dir(&directory), Err)
+        {
             Ok(children) => children,
             Err(error) => {
                 skipped.push(SkippedLocation {
@@ -61,7 +77,9 @@ pub fn scan_root_with_progress(
                 }
             };
             let path = child.path();
-            let metadata = match fs::symlink_metadata(&path) {
+            let metadata = match denied(&path, ScanOperation::Metadata)
+                .map_or_else(|| fs::symlink_metadata(&path), Err)
+            {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     skipped.push(SkippedLocation {
@@ -131,6 +149,8 @@ fn system_time_ns(time: Option<std::time::SystemTime>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
@@ -155,5 +175,72 @@ mod tests {
         assert!(paths.contains(&root.path().join("folder-link").as_path()));
         assert_eq!(paths.len(), 3);
         assert_eq!(report.coverage(), Coverage::Complete);
+    }
+
+    #[test]
+    fn denied_paths_are_reported_while_accessible_siblings_are_indexed() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("denied")).unwrap();
+        fs::write(root.path().join("denied/private.txt"), "private").unwrap();
+        fs::write(root.path().join("accessible.txt"), "accessible").unwrap();
+
+        let report = scan_root_with_policy(
+            root.path(),
+            |_| {},
+            |path, operation| {
+                (path.ends_with("denied") && operation == ScanOperation::Enumerate).then(|| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied")
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(report.coverage(), Coverage::Partial);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.name == "accessible.txt")
+        );
+        assert!(report.entries.iter().any(|entry| entry.name == "denied"));
+        assert!(
+            !report
+                .entries
+                .iter()
+                .any(|entry| entry.name == "private.txt")
+        );
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].reason.contains("permission denied"));
+    }
+
+    #[test]
+    fn metadata_denial_does_not_abort_other_entries() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("denied.txt"), "denied").unwrap();
+        fs::write(root.path().join("visible.txt"), "visible").unwrap();
+        let report = scan_root_with_policy(
+            root.path(),
+            |_| {},
+            |path, operation| {
+                (path.ends_with("denied.txt") && operation == ScanOperation::Metadata).then(|| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "metadata denied")
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(report.coverage(), Coverage::Partial);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "visible.txt");
+    }
+
+    #[test]
+    fn scanning_never_opens_entry_contents() {
+        let root = tempdir().unwrap();
+        let fifo = root.path().join("cloud-placeholder");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let report = scan_root(root.path()).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].name, "cloud-placeholder");
+        assert_eq!(report.entries[0].kind, EntryKind::Other);
     }
 }

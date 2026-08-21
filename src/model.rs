@@ -85,6 +85,27 @@ pub struct SkippedLocation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootCoverage {
+    pub volume_id: u64,
+    pub root: PathBuf,
+    pub coverage: Coverage,
+    pub skipped: Vec<SkippedLocation>,
+}
+
+pub fn overall_coverage(reports: &[RootCoverage]) -> Option<Coverage> {
+    (!reports.is_empty()).then(|| {
+        if reports
+            .iter()
+            .all(|report| report.coverage == Coverage::Complete)
+        {
+            Coverage::Complete
+        } else {
+            Coverage::Partial
+        }
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchResult {
     pub entry_id: u64,
     pub name: String,
@@ -116,5 +137,24 @@ mod tests {
         let snapshot = AppSnapshot::default();
         assert_eq!(snapshot.file_index.title(), "No File Index");
         assert!(snapshot.file_index.detail().contains("not built"));
+    }
+
+    #[test]
+    fn overall_coverage_requires_reports_and_every_root_complete() {
+        assert_eq!(overall_coverage(&[]), None);
+        let report = |coverage| RootCoverage {
+            volume_id: 1,
+            root: "/".into(),
+            coverage,
+            skipped: Vec::new(),
+        };
+        assert_eq!(
+            overall_coverage(&[report(Coverage::Complete)]),
+            Some(Coverage::Complete)
+        );
+        assert_eq!(
+            overall_coverage(&[report(Coverage::Complete), report(Coverage::Partial)]),
+            Some(Coverage::Partial)
+        );
     }
 }
