@@ -123,7 +123,7 @@ fn scan_root_with_policy(
             });
             progress(entries.len() as u64);
 
-            if file_type.is_dir() && !file_type.is_symlink() {
+            if file_type.is_dir() && !is_application_package(&path) {
                 pending.push_back(path);
             }
         }
@@ -136,6 +136,11 @@ fn scan_root_with_policy(
         entries,
         skipped,
     })
+}
+
+fn is_application_package(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
 }
 
 fn stable_entry_id(volume_id: u64, inode: u64) -> u64 {
@@ -175,6 +180,48 @@ mod tests {
         assert!(paths.contains(&root.path().join("folder-link").as_path()));
         assert_eq!(paths.len(), 3);
         assert_eq!(report.coverage(), Coverage::Complete);
+    }
+
+    #[test]
+    fn hidden_entries_are_indexed_and_application_packages_are_atomic() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(".hidden-note"), "hidden").unwrap();
+        let package = root.path().join("Demo.app");
+        fs::create_dir_all(package.join("Contents/Resources")).unwrap();
+        fs::write(package.join("Contents/Resources/private.txt"), "private").unwrap();
+
+        let report = scan_root(root.path()).unwrap();
+        let hidden = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == ".hidden-note")
+            .unwrap();
+        assert!(hidden.hidden);
+        assert!(report.entries.iter().any(|entry| entry.path == package));
+        assert!(
+            !report
+                .entries
+                .iter()
+                .any(|entry| entry.path.starts_with(package.join("Contents")))
+        );
+    }
+
+    #[test]
+    fn symlink_loops_and_links_outside_the_root_are_single_entries() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("outside.txt"), "outside").unwrap();
+        symlink(root.path(), root.path().join("loop")).unwrap();
+        symlink(outside.path(), root.path().join("outside-link")).unwrap();
+
+        let report = scan_root(root.path()).unwrap();
+        assert_eq!(report.entries.len(), 2);
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|entry| entry.kind == EntryKind::Symlink)
+        );
     }
 
     #[test]

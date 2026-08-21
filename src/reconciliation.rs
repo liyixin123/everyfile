@@ -309,6 +309,16 @@ fn minimal_safe_scopes(root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
     for path in paths.iter().filter(|path| path.starts_with(root)) {
         let scope = if path == root {
             root.to_path_buf()
+        } else if let Some(package) = path
+            .ancestors()
+            .take_while(|ancestor| ancestor.starts_with(root))
+            .find(|ancestor| {
+                ancestor
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+            })
+        {
+            package.parent().unwrap_or(root).to_path_buf()
         } else {
             path.parent()
                 .filter(|parent| parent.starts_with(root))
@@ -524,5 +534,17 @@ mod tests {
             repaired.projection.search("stale.txt", 100).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn package_descendant_hints_rescan_only_the_package_parent() {
+        let root = PathBuf::from("/root");
+        let scopes = minimal_safe_scopes(
+            &root,
+            &[PathBuf::from(
+                "/root/Applications/Demo.app/Contents/Resources/icon.icns",
+            )],
+        );
+        assert_eq!(scopes, vec![PathBuf::from("/root/Applications")]);
     }
 }
