@@ -8,6 +8,8 @@ crossbeam-channel = "0.5.16"
 libc = "0.2.189"
 memmap2 = "0.9.8"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+unicode-casefold = "0.2.0"
+unicode-normalization = "0.1.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

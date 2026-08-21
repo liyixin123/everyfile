@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -6,9 +7,10 @@ use memmap2::{Mmap, MmapOptions};
 
 use crate::index::CommittedIndex;
 use crate::model::SearchResult;
+use crate::query::{QueryCandidate, normalize_search_text, rank_candidates};
 
 const MAGIC: &[u8; 8] = b"EVFLIDX\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_LEN: usize = 24;
 
 pub struct SearchProjection {
@@ -32,13 +34,19 @@ impl SearchProjection {
             let name = entry.name.as_bytes();
             let path = entry.path.to_string_lossy();
             let path = path.as_bytes();
+            let normalized_name = normalize_search_text(&entry.name);
+            let normalized_path = normalize_search_text(&entry.path.to_string_lossy());
             file.write_all(&entry.entry_id.to_le_bytes())?;
             file.write_all(&entry.size.to_le_bytes())?;
             file.write_all(&entry.modified_ns.unwrap_or(i64::MIN).to_le_bytes())?;
             file.write_all(&(name.len() as u32).to_le_bytes())?;
             file.write_all(&(path.len() as u32).to_le_bytes())?;
+            file.write_all(&(normalized_name.len() as u32).to_le_bytes())?;
+            file.write_all(&(normalized_path.len() as u32).to_le_bytes())?;
             file.write_all(name)?;
             file.write_all(path)?;
+            file.write_all(normalized_name.as_bytes())?;
+            file.write_all(normalized_path.as_bytes())?;
         }
         file.sync_all()?;
         drop(file);
@@ -74,8 +82,16 @@ impl SearchProjection {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchResult>> {
-        let query = query.to_lowercase();
-        let mut results = Vec::new();
+        self.search_with_history(query, &HashMap::new(), limit)
+    }
+
+    pub fn search_with_history(
+        &self,
+        query: &str,
+        recent_opens: &HashMap<u64, u64>,
+        limit: usize,
+    ) -> io::Result<Vec<SearchResult>> {
+        let mut candidates = Vec::with_capacity(self.record_count as usize);
         let mut offset = HEADER_LEN;
         for _ in 0..self.record_count {
             let entry_id = read_u64(&self.map, offset)?;
@@ -83,28 +99,30 @@ impl SearchProjection {
             let raw_modified = read_i64(&self.map, offset + 16)?;
             let name_len = read_u32(&self.map, offset + 24)? as usize;
             let path_len = read_u32(&self.map, offset + 28)? as usize;
-            offset += 32;
+            let normalized_name_len = read_u32(&self.map, offset + 32)? as usize;
+            let normalized_path_len = read_u32(&self.map, offset + 36)? as usize;
+            offset += 40;
             let name = read_str(&self.map, offset, name_len)?;
             offset += name_len;
             let path = read_str(&self.map, offset, path_len)?;
             offset += path_len;
-            if query.is_empty()
-                || name.to_lowercase().contains(&query)
-                || path.to_lowercase().contains(&query)
-            {
-                results.push(SearchResult {
+            let normalized_name = read_str(&self.map, offset, normalized_name_len)?;
+            offset += normalized_name_len;
+            let normalized_path = read_str(&self.map, offset, normalized_path_len)?;
+            offset += normalized_path_len;
+            candidates.push(QueryCandidate {
+                result: SearchResult {
                     entry_id,
                     name: name.to_owned(),
                     path: PathBuf::from(path),
                     size,
                     modified_ns: (raw_modified != i64::MIN).then_some(raw_modified),
-                });
-                if results.len() == limit {
-                    break;
-                }
-            }
+                },
+                normalized_name: normalized_name.to_owned(),
+                normalized_path: normalized_path.to_owned(),
+            });
         }
-        Ok(results)
+        Ok(rank_candidates(query, candidates, recent_opens, limit))
     }
 }
 
@@ -117,17 +135,27 @@ fn validate_records(map: &[u8], count: u32) -> io::Result<()> {
     for _ in 0..count {
         let name_len = read_u32(map, offset + 24)? as usize;
         let path_len = read_u32(map, offset + 28)? as usize;
+        let normalized_name_len = read_u32(map, offset + 32)? as usize;
+        let normalized_path_len = read_u32(map, offset + 36)? as usize;
         offset = offset
-            .checked_add(32)
+            .checked_add(40)
             .and_then(|value| value.checked_add(name_len))
             .and_then(|value| value.checked_add(path_len))
+            .and_then(|value| value.checked_add(normalized_name_len))
+            .and_then(|value| value.checked_add(normalized_path_len))
             .ok_or_else(|| invalid("projection offsets overflow"))?;
         if offset > map.len() {
             return Err(invalid("projection record exceeds file"));
         }
-        let name_start = offset - path_len - name_len;
+        let name_start = offset - normalized_path_len - normalized_name_len - path_len - name_len;
         read_str(map, name_start, name_len)?;
         read_str(map, name_start + name_len, path_len)?;
+        read_str(map, name_start + name_len + path_len, normalized_name_len)?;
+        read_str(
+            map,
+            name_start + name_len + path_len + normalized_name_len,
+            normalized_path_len,
+        )?;
     }
     if offset != map.len() {
         return Err(invalid("projection has trailing bytes"));
