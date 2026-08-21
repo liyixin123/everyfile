@@ -14,8 +14,6 @@ Every change follows the issue-driven loop:
 4. **Squash merge.** The merge title is an imperative one-liner describing the delivered capability, with the PR number appended (e.g. `Recover safely from damaged file indexes (#32)`).
 5. **Close the issue** after merge.
 
-Each squashed commit should be a complete, releasable unit (code + tests + docs). Feature tickets deliver a matching `docs/architecture/*.md`; qualification tickets deliver `docs/qualification/*.md`.
-
 Merging to `master` requires the issue → branch → PR → squash loop above. Exception: trivial fixes (typos, doc tweaks) may go straight to `master`. Opening an issue and a branch is cheap; when in doubt, use the loop.
 
 Each squashed commit should be a complete, releasable unit (code + tests + docs). Feature tickets deliver a matching `docs/architecture/*.md`; qualification tickets deliver `docs/qualification/*.md`.
