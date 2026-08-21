@@ -23,6 +23,35 @@ pub struct SearchProjection {
 }
 
 impl SearchProjection {
+    pub fn build_combined(path: &Path, committed: &[CommittedIndex]) -> io::Result<Self> {
+        let combined = CommittedIndex {
+            generation: committed
+                .iter()
+                .map(|index| index.generation)
+                .max()
+                .unwrap_or(0),
+            volume_id: 0,
+            root: PathBuf::new(),
+            coverage: if committed
+                .iter()
+                .all(|index| index.coverage == crate::model::Coverage::Complete)
+            {
+                crate::model::Coverage::Complete
+            } else {
+                crate::model::Coverage::Partial
+            },
+            entries: committed
+                .iter()
+                .flat_map(|index| index.entries.iter().cloned())
+                .collect(),
+            skipped: committed
+                .iter()
+                .flat_map(|index| index.skipped.iter().cloned())
+                .collect(),
+        };
+        Self::build(path, &combined)
+    }
+
     pub fn build(path: &Path, committed: &CommittedIndex) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -287,5 +316,29 @@ mod tests {
         fs::remove_file(&path).unwrap();
         let rebuilt = SearchProjection::build(&path, &committed).unwrap();
         assert_eq!(rebuilt.search("budget", 100).unwrap()[0].name, "Budget.txt");
+    }
+
+    #[test]
+    fn combined_projection_keeps_results_from_multiple_roots() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        fs::write(first.path().join("internal.txt"), "internal").unwrap();
+        fs::write(second.path().join("external.txt"), "external").unwrap();
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        let mut store = IndexStore::open(&database).unwrap();
+        store
+            .commit_scan(&scan_root(first.path()).unwrap())
+            .unwrap();
+        store
+            .commit_scan(&scan_root(second.path()).unwrap())
+            .unwrap();
+        let committed = store.all_committed().unwrap();
+        assert_eq!(committed.len(), 2);
+        let projection =
+            SearchProjection::build_combined(&data.path().join("combined.projection"), &committed)
+                .unwrap();
+        assert_eq!(projection.search("internal.txt", 100).unwrap().len(), 1);
+        assert_eq!(projection.search("external.txt", 100).unwrap().len(), 1);
     }
 }

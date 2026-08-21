@@ -4,7 +4,7 @@ use std::ptr;
 
 use crossbeam_channel::{Receiver, unbounded};
 use objc2::rc::Retained;
-use objc2_foundation::{NSArray, NSString};
+use objc2_foundation::{NSArray, NSString, NSURL, NSURLVolumeUUIDStringKey};
 
 use crate::reconciliation::EventBatch;
 
@@ -113,7 +113,8 @@ pub fn stream_identity(root: &Path) -> Result<String, String> {
         .dev() as libc::dev_t;
     let uuid = unsafe { FSEventsCopyUUIDForDevice(device) };
     if uuid.is_null() {
-        return Err("FSEvents volume UUID is unavailable".into());
+        return url_volume_identity(root)
+            .ok_or_else(|| "FSEvents volume UUID is unavailable".into());
     }
     let string = unsafe { CFUUIDCreateString(ptr::null(), uuid) };
     if string.is_null() {
@@ -135,6 +136,20 @@ pub fn stream_identity(root: &Path) -> Result<String, String> {
     CStr::from_bytes_until_nul(&bytes)
         .map(|value| value.to_string_lossy().into_owned())
         .map_err(|error| error.to_string())
+}
+
+fn url_volume_identity(root: &Path) -> Option<String> {
+    let path = NSString::from_str(&root.to_string_lossy());
+    let url = NSURL::fileURLWithPath(&path);
+    let mut value = None;
+    unsafe {
+        url.getResourceValue_forKey_error(&mut value, NSURLVolumeUUIDStringKey)
+            .ok()?;
+    }
+    value?
+        .downcast::<NSString>()
+        .ok()
+        .map(|value| value.to_string())
 }
 
 unsafe extern "C" fn event_callback(

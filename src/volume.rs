@@ -3,9 +3,33 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Volume {
     pub id: u64,
+    pub identity: String,
     pub mount_path: PathBuf,
     pub filesystem: String,
+    pub local: bool,
     pub internal: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VolumeKind {
+    InternalLocal,
+    ExternalLocal,
+    Network,
+}
+
+impl Volume {
+    pub const fn kind(&self) -> VolumeKind {
+        if !self.local {
+            VolumeKind::Network
+        } else if self.internal {
+            VolumeKind::InternalLocal
+        } else {
+            VolumeKind::ExternalLocal
+        }
+    }
+    pub const fn enabled_by_default(&self) -> bool {
+        matches!(self.kind(), VolumeKind::InternalLocal)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -32,7 +56,10 @@ pub fn discover_mounted_volumes() -> std::io::Result<Vec<Volume>> {
         mount_path.hash(&mut id);
         volumes.push(Volume {
             id: id.finish(),
+            identity: crate::fsevents::stream_identity(&mount_path)
+                .unwrap_or_else(|_| format!("mount:{}", mount_path.display())),
             internal: local && !mount_path.starts_with("/Volumes"),
+            local,
             mount_path,
             filesystem,
         });
@@ -62,14 +89,18 @@ mod tests {
         let volumes = vec![
             Volume {
                 id: 1,
+                identity: "internal".into(),
                 mount_path: PathBuf::from("/"),
                 filesystem: "apfs".into(),
+                local: true,
                 internal: true,
             },
             Volume {
                 id: 2,
+                identity: "external".into(),
                 mount_path: PathBuf::from("/Volumes/Test"),
                 filesystem: "apfs".into(),
+                local: true,
                 internal: false,
             },
         ];
@@ -87,5 +118,20 @@ mod tests {
         let volumes = discover_mounted_volumes().unwrap();
         let root = volume_containing(&volumes, Path::new("/")).unwrap();
         assert!(root.internal);
+    }
+
+    #[test]
+    fn only_internal_local_volumes_are_enabled_by_default() {
+        let volume = |local, internal| Volume {
+            id: 1,
+            identity: "id".into(),
+            mount_path: "/Volumes/Test".into(),
+            filesystem: "apfs".into(),
+            local,
+            internal,
+        };
+        assert!(volume(true, true).enabled_by_default());
+        assert!(!volume(true, false).enabled_by_default());
+        assert_eq!(volume(false, false).kind(), VolumeKind::Network);
     }
 }

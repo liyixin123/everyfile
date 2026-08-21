@@ -190,8 +190,12 @@ pub fn reconcile_committed_root(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "reconciliation committed without a published generation".to_owned())?;
     let coverage = committed.coverage;
-    let projection = SearchProjection::build(&data_directory.join("search.projection"), &committed)
+    let enabled = store
+        .enabled_committed()
         .map_err(|error| error.to_string())?;
+    let projection =
+        SearchProjection::build_combined(&data_directory.join("search.projection"), &enabled)
+            .map_err(|error| error.to_string())?;
     Ok(ReconciledIndex {
         projection,
         coverage,
@@ -281,8 +285,12 @@ fn reconcile_committed_scopes(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "repair committed without a published generation".to_owned())?;
     let coverage = committed.coverage;
-    let projection = SearchProjection::build(&data_directory.join("search.projection"), &committed)
+    let enabled = store
+        .enabled_committed()
         .map_err(|error| error.to_string())?;
+    let projection =
+        SearchProjection::build_combined(&data_directory.join("search.projection"), &enabled)
+            .map_err(|error| error.to_string())?;
     Ok(ReconciledIndex {
         projection,
         coverage,
