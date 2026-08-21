@@ -4,8 +4,9 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -22,8 +23,8 @@ use objc2_app_kit::{
     NSWorkspaceDidUnmountNotification, NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSTimer,
-    NSURL, NSUserDefaults, ns_string,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo,
+    NSProcessInfoThermalState, NSRect, NSSize, NSTimer, NSURL, NSUserDefaults, ns_string,
 };
 
 use crate::actions::{ResultAction, ResultActionDispatcher};
@@ -31,6 +32,7 @@ use crate::coordinator::{
     build_first_index_with_progress, configured_root, default_data_directory,
 };
 use crate::index::IndexStore;
+use crate::indexing_control::{ResourceConditions, WorkAllowance, work_allowance};
 use crate::model::{
     AppSnapshot, Coverage, FileIndexState, Freshness, RootCoverage, SearchResult, overall_coverage,
 };
@@ -81,6 +83,7 @@ type EventHandlerProc =
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
+    fn os_proc_available_memory() -> usize;
     fn GetApplicationEventTarget() -> EventTargetRef;
     fn InstallEventHandler(
         target: EventTargetRef,
@@ -129,6 +132,9 @@ struct AppDelegateIvars {
     external_state_initialized: Cell<bool>,
     coalescing_preset: Cell<CoalescingPreset>,
     show_hidden: Cell<bool>,
+    user_paused: Arc<AtomicBool>,
+    accelerate_pending: Cell<bool>,
+    next_reduced_work: Cell<Instant>,
 }
 
 struct RuntimeIndex {
@@ -198,6 +204,9 @@ impl Default for AppDelegateIvars {
             external_state_initialized: Cell::new(false),
             coalescing_preset: Cell::new(CoalescingPreset::Balanced),
             show_hidden: Cell::new(true),
+            user_paused: Arc::new(AtomicBool::new(false)),
+            accelerate_pending: Cell::new(false),
+            next_reduced_work: Cell::new(Instant::now()),
         }
     }
 }
@@ -435,6 +444,29 @@ define_class!(
             self.clear_open_history();
         }
 
+        #[unsafe(method(pauseIndexing:))]
+        fn pause_indexing_action(&self, _sender: Option<&AnyObject>) {
+            self.ivars().user_paused.store(true, Ordering::Release);
+        }
+
+        #[unsafe(method(resumeIndexing:))]
+        fn resume_indexing_action(&self, _sender: Option<&AnyObject>) {
+            self.ivars().user_paused.store(false, Ordering::Release);
+            self.ivars().accelerate_pending.set(true);
+            self.poll_fsevents();
+        }
+
+        #[unsafe(method(processPendingChanges:))]
+        fn process_pending_changes_action(&self, _sender: Option<&AnyObject>) {
+            self.ivars().accelerate_pending.set(true);
+            self.poll_fsevents();
+        }
+
+        #[unsafe(method(rebuildConfiguredVolume:))]
+        fn rebuild_configured_volume_action(&self, _sender: Option<&AnyObject>) {
+            self.request_configured_volume_rebuild();
+        }
+
         #[unsafe(method(copySelectedPath:))]
         fn copy_selected_path_action(&self, _sender: Option<&AnyObject>) {
             self.dispatch_selected(ResultAction::CopyPath);
@@ -504,6 +536,8 @@ impl Delegate {
 
     fn show_search_window(&self) {
         let started = Instant::now();
+        self.ivars().accelerate_pending.set(true);
+        self.poll_fsevents();
         let Some(window) = self.ivars().window.get() else {
             return;
         };
@@ -526,6 +560,8 @@ impl Delegate {
             return;
         };
         let runtime = Arc::clone(&self.ivars().runtime);
+        let user_paused = Arc::clone(&self.ivars().user_paused);
+        let resource_root = root.clone();
         runtime.lock().unwrap().state = FileIndexState::Rebuilding { scanned_entries: 0 };
         let data_directory = default_data_directory();
         let schedule_result = self
@@ -539,6 +575,23 @@ impl Delegate {
                     &root,
                     &data_directory,
                     move |scanned_entries| {
+                        loop {
+                            match work_allowance(
+                                user_paused.load(Ordering::Acquire),
+                                current_resource_conditions(&resource_root),
+                            ) {
+                                WorkAllowance::Paused => {
+                                    std::thread::sleep(Duration::from_millis(250));
+                                }
+                                WorkAllowance::Reduced => {
+                                    if scanned_entries % 256 == 0 {
+                                        std::thread::sleep(Duration::from_millis(10));
+                                    }
+                                    break;
+                                }
+                                WorkAllowance::Normal => break,
+                            }
+                        }
                         progress_runtime.lock().unwrap().state =
                             FileIndexState::Rebuilding { scanned_entries };
                     },
@@ -591,14 +644,21 @@ impl Delegate {
                 table.reloadData();
             }
         }
-        let title = match runtime.freshness {
-            Freshness::CatchingUp => "File Index: Catching Up",
-            Freshness::Offline => "File Index: Offline",
-            _ => runtime.state.title(),
+        let paused = self.ivars().user_paused.load(Ordering::Acquire);
+        let title = if paused {
+            "File Index: Paused"
+        } else {
+            match runtime.freshness {
+                Freshness::CatchingUp => "File Index: Catching Up",
+                Freshness::Offline => "File Index: Offline",
+                _ => runtime.state.title(),
+            }
         };
         let coverage = overall_coverage(&runtime.coverage_reports);
         let detail = runtime.error.clone().unwrap_or_else(|| {
-            if runtime.freshness == Freshness::CatchingUp {
+            if paused {
+                "Indexing is paused; committed search results remain available.".into()
+            } else if runtime.freshness == Freshness::CatchingUp {
                 "Applying pending filesystem changes to the committed File Index…".into()
             } else if let Some(coverage) = coverage {
                 format!(
@@ -743,6 +803,27 @@ impl Delegate {
         if !self.ivars().event_hints.borrow().has_pending() {
             return;
         }
+        let root = configured_root().and_then(|root| root.canonicalize().ok());
+        let Some(root) = root else { return };
+        let allowance = work_allowance(
+            self.ivars().user_paused.load(Ordering::Acquire),
+            current_resource_conditions(&root),
+        );
+        if allowance == WorkAllowance::Paused {
+            return;
+        }
+        let accelerated = self.ivars().accelerate_pending.replace(false);
+        if allowance == WorkAllowance::Reduced
+            && !accelerated
+            && Instant::now() < self.ivars().next_reduced_work.get()
+        {
+            return;
+        }
+        if allowance == WorkAllowance::Reduced {
+            self.ivars()
+                .next_reduced_work
+                .set(Instant::now() + Duration::from_secs(2));
+        }
         {
             let mut runtime = self.ivars().runtime.lock().unwrap();
             if runtime.reconciliation_in_flight {
@@ -752,9 +833,6 @@ impl Delegate {
             runtime.freshness = Freshness::CatchingUp;
         }
         let Some(mut batch) = self.ivars().event_hints.borrow_mut().take() else {
-            return;
-        };
-        let Some(root) = configured_root().and_then(|root| root.canonicalize().ok()) else {
             return;
         };
         let plan = plan_batch(&root, &batch);
@@ -975,6 +1053,26 @@ impl Delegate {
         }
         self.ivars().runtime.lock().unwrap().recent_opens.clear();
         self.run_search();
+    }
+
+    fn request_configured_volume_rebuild(&self) {
+        let Some(root) = configured_root().and_then(|root| root.canonicalize().ok()) else {
+            return;
+        };
+        let Ok(identity) = fsevents::stream_identity(&root) else {
+            return;
+        };
+        self.ivars().event_hints.borrow_mut().push(EventBatch {
+            stream_identity: identity,
+            highest_event_id: fsevents::current_event_id(),
+            paths: vec![root],
+            history_lost: false,
+            ids_wrapped: false,
+            root_changed: true,
+        });
+        self.ivars().user_paused.store(false, Ordering::Release);
+        self.ivars().accelerate_pending.set(true);
+        self.poll_fsevents();
     }
 
     fn show_skipped_locations(&self) {
@@ -1570,6 +1668,42 @@ fn build_status_item(
         ns_string!(""),
         true,
     );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Pause Indexing"),
+        sel!(pauseIndexing:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Resume Indexing"),
+        sel!(resumeIndexing:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Process Pending Changes"),
+        sel!(processPendingChanges:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Rebuild Configured Volume"),
+        sel!(rebuildConfiguredVolume:),
+        ns_string!(""),
+        true,
+    );
     let state = add_menu_item(
         mtm,
         &menu,
@@ -1712,6 +1846,24 @@ fn build_main_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMen
         ns_string!(""),
         true,
     );
+    for (title, action) in [
+        ("Pause Indexing", sel!(pauseIndexing:)),
+        ("Resume Indexing", sel!(resumeIndexing:)),
+        ("Process Pending Changes", sel!(processPendingChanges:)),
+        ("Rebuild Configured Volume", sel!(rebuildConfiguredVolume:)),
+        ("Skipped Locations…", sel!(showSkippedLocations:)),
+        ("Settings…", sel!(showSettings:)),
+    ] {
+        add_menu_item(
+            mtm,
+            &edit_menu,
+            delegate,
+            &objc2_foundation::NSString::from_str(title),
+            action,
+            ns_string!(""),
+            true,
+        );
+    }
     edit_item.setSubmenu(Some(&edit_menu));
     main_menu.addItem(&edit_item);
     main_menu
@@ -1738,6 +1890,21 @@ fn add_menu_item(
     item.setEnabled(enabled);
     menu.addItem(&item);
     item
+}
+
+fn current_resource_conditions(root: &std::path::Path) -> ResourceConditions {
+    let process = NSProcessInfo::processInfo();
+    ResourceConditions {
+        low_power_mode: process.isLowPowerModeEnabled(),
+        on_battery: false,
+        battery_percent: None,
+        severe_thermal_state: matches!(
+            process.thermalState(),
+            NSProcessInfoThermalState::Serious | NSProcessInfoThermalState::Critical
+        ),
+        memory_pressure: unsafe { os_proc_available_memory() } < 256 * 1024 * 1024,
+        volume_available: root.exists(),
+    }
 }
 
 pub fn run() {

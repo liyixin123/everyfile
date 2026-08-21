@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod coordinator;
 pub mod index;
+pub mod indexing_control;
 pub mod model;
 pub mod projection;
 pub mod query;

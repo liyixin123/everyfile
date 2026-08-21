@@ -135,14 +135,7 @@ impl HintCoalescer {
         self.ids_wrapped |= batch.ids_wrapped;
         self.root_changed |= batch.root_changed;
         self.stream_identity = batch.stream_identity;
-        for path in batch.paths {
-            if self.paths.iter().any(|existing| path.starts_with(existing)) {
-                continue;
-            }
-            self.paths.retain(|existing| !existing.starts_with(&path));
-            self.paths.push(path);
-        }
-        self.paths.sort_unstable();
+        self.paths.extend(batch.paths);
     }
 
     pub fn has_pending(&self) -> bool {
@@ -153,10 +146,22 @@ impl HintCoalescer {
         if !self.has_pending() {
             return None;
         }
+        let mut paths = std::mem::take(&mut self.paths);
+        paths.sort_unstable();
+        let mut coalesced: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        for path in paths {
+            if coalesced
+                .last()
+                .is_some_and(|ancestor| path.starts_with(ancestor))
+            {
+                continue;
+            }
+            coalesced.push(path);
+        }
         Some(EventBatch {
             stream_identity: std::mem::take(&mut self.stream_identity),
             highest_event_id: std::mem::take(&mut self.highest_event_id),
-            paths: std::mem::take(&mut self.paths),
+            paths: coalesced,
             history_lost: std::mem::take(&mut self.history_lost),
             ids_wrapped: std::mem::take(&mut self.ids_wrapped),
             root_changed: std::mem::take(&mut self.root_changed),
@@ -546,5 +551,24 @@ mod tests {
             )],
         );
         assert_eq!(scopes, vec![PathBuf::from("/root/Applications")]);
+    }
+
+    #[test]
+    fn ten_thousand_pending_changes_coalesce_well_inside_the_acceleration_gate() {
+        let started = std::time::Instant::now();
+        let mut coalescer = HintCoalescer::default();
+        for index in 0..10_000 {
+            coalescer.push(EventBatch {
+                stream_identity: "volume-a".into(),
+                highest_event_id: index,
+                paths: vec![PathBuf::from(format!("/root/folder-{index}/file.txt"))],
+                history_lost: false,
+                ids_wrapped: false,
+                root_changed: false,
+            });
+        }
+        let batch = coalescer.take().unwrap();
+        assert_eq!(batch.paths.len(), 10_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }
