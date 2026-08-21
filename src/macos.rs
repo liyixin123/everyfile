@@ -148,6 +148,7 @@ struct RuntimeIndex {
     query_refresh_needed: bool,
     coverage_reports: Vec<RootCoverage>,
     offline_external_roots: Vec<std::path::PathBuf>,
+    recovery_notice: Option<String>,
 }
 
 struct QueryPublication {
@@ -187,6 +188,7 @@ impl Default for AppDelegateIvars {
                 query_refresh_needed: false,
                 coverage_reports: Vec::new(),
                 offline_external_roots: Vec::new(),
+                recovery_notice: None,
             })),
             results: RefCell::new(Vec::new()),
             hot_key: Cell::new(ptr::null_mut()),
@@ -609,6 +611,12 @@ impl Delegate {
                         runtime.freshness = Freshness::Current;
                         runtime.query_refresh_needed = true;
                         runtime.coverage_reports = vec![built.coverage_report];
+                        runtime.recovery_notice = built.recovery_archive.map(|path| {
+                            format!(
+                                "Recovered a new File Index; damaged database preserved at {}",
+                                path.display()
+                            )
+                        });
                     }
                     Err(error) => {
                         runtime.state = FileIndexState::NotAvailable;
@@ -661,13 +669,17 @@ impl Delegate {
             } else if runtime.freshness == Freshness::CatchingUp {
                 "Applying pending filesystem changes to the committed File Index…".into()
             } else if let Some(coverage) = coverage {
-                format!(
+                let status = format!(
                     "Freshness: {:?} · Coverage: {:?} across {} configured root(s) · {} external Offline",
                     runtime.freshness,
                     coverage,
                     runtime.coverage_reports.len(),
                     runtime.offline_external_roots.len()
-                )
+                );
+                runtime
+                    .recovery_notice
+                    .as_ref()
+                    .map_or(status.clone(), |notice| format!("{notice} · {status}"))
             } else {
                 runtime.state.detail()
             }
@@ -1894,6 +1906,7 @@ fn add_menu_item(
 
 fn current_resource_conditions(root: &std::path::Path) -> ResourceConditions {
     let process = NSProcessInfo::processInfo();
+    let available_memory = unsafe { os_proc_available_memory() };
     ResourceConditions {
         low_power_mode: process.isLowPowerModeEnabled(),
         on_battery: false,
@@ -1902,7 +1915,7 @@ fn current_resource_conditions(root: &std::path::Path) -> ResourceConditions {
             process.thermalState(),
             NSProcessInfoThermalState::Serious | NSProcessInfoThermalState::Critical
         ),
-        memory_pressure: unsafe { os_proc_available_memory() } < 256 * 1024 * 1024,
+        memory_pressure: available_memory > 0 && available_memory < 128 * 1024 * 1024,
         volume_available: root.exists(),
     }
 }

@@ -10,6 +10,7 @@ pub struct BuiltIndex {
     pub state: FileIndexState,
     pub projection: SearchProjection,
     pub coverage_report: RootCoverage,
+    pub recovery_archive: Option<PathBuf>,
 }
 
 pub fn build_first_index(root: &Path, data_directory: &Path) -> Result<BuiltIndex, String> {
@@ -27,8 +28,8 @@ pub fn build_first_index_with_progress(
     let volumes = discover_mounted_volumes().map_err(|error| error.to_string())?;
     let volume = volume_containing(&volumes, &canonical_root)
         .ok_or_else(|| "configured root is not on a discovered volume".to_owned())?;
-    let mut store = IndexStore::open(&data_directory.join("index.sqlite3"))
-        .map_err(|error| error.to_string())?;
+    let (mut store, recovery_archive) =
+        IndexStore::open_or_recover(&data_directory.join("index.sqlite3"))?;
     for discovered in &volumes {
         store
             .observe_volume(discovered)
@@ -67,6 +68,7 @@ pub fn build_first_index_with_progress(
                 coverage: committed.coverage,
                 skipped: committed.skipped,
             },
+            recovery_archive,
         });
     }
 
@@ -104,6 +106,7 @@ pub fn build_first_index_with_progress(
             coverage: committed.coverage,
             skipped: committed.skipped,
         },
+        recovery_archive,
     })
 }
 
@@ -163,6 +166,25 @@ mod tests {
         assert_eq!(
             restarted.projection.search("everyfile", 100).unwrap().len(),
             1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn damaged_index_is_archived_before_verified_rebuild_publication() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("verified.txt"), "verified").unwrap();
+        let data = tempdir().unwrap();
+        fs::write(data.path().join("index.sqlite3"), b"damaged sqlite").unwrap();
+
+        let built = build_first_index(root.path(), data.path()).unwrap();
+        assert!(built.recovery_archive.as_ref().unwrap().exists());
+        assert_eq!(built.projection.search("verified", 100).unwrap().len(), 1);
+        assert_eq!(
+            built.state,
+            FileIndexState::Current {
+                coverage: Coverage::Complete
+            }
         );
     }
 }
