@@ -19,6 +19,15 @@ pub struct CommittedIndex {
     pub entries: Vec<IndexedEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeCheckpoint {
+    pub volume_id: u64,
+    pub root: PathBuf,
+    pub stream_identity: String,
+    pub event_id: u64,
+    pub generation: u64,
+}
+
 impl IndexStore {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -33,6 +42,23 @@ impl IndexStore {
     }
 
     pub fn commit_scan(&mut self, report: &ScanReport) -> rusqlite::Result<u64> {
+        self.commit_scan_with_checkpoint(report, None)
+    }
+
+    pub fn commit_reconciliation(
+        &mut self,
+        report: &ScanReport,
+        stream_identity: &str,
+        event_id: u64,
+    ) -> rusqlite::Result<u64> {
+        self.commit_scan_with_checkpoint(report, Some((stream_identity, event_id)))
+    }
+
+    fn commit_scan_with_checkpoint(
+        &mut self,
+        report: &ScanReport,
+        checkpoint: Option<(&str, u64)>,
+    ) -> rusqlite::Result<u64> {
         let transaction = self.connection.transaction()?;
         let next_generation = transaction.query_row(
             "SELECT COALESCE(MAX(generation), 0) + 1 FROM scan_generations",
@@ -88,8 +114,49 @@ impl IndexStore {
                 coverage_text(report.coverage())
             ],
         )?;
+        if let Some((stream_identity, event_id)) = checkpoint {
+            transaction.execute(
+                "INSERT INTO volume_checkpoints
+                 (volume_id, root_path, stream_identity, event_id, generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(volume_id, root_path) DO UPDATE SET
+                     stream_identity = excluded.stream_identity,
+                     event_id = excluded.event_id,
+                     generation = excluded.generation",
+                params![
+                    report.volume_id as i64,
+                    report.root.to_string_lossy(),
+                    stream_identity,
+                    event_id as i64,
+                    next_generation as i64,
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(next_generation)
+    }
+
+    pub fn checkpoint(
+        &self,
+        volume_id: u64,
+        root: &Path,
+    ) -> rusqlite::Result<Option<VolumeCheckpoint>> {
+        self.connection
+            .query_row(
+                "SELECT stream_identity, event_id, generation FROM volume_checkpoints
+                 WHERE volume_id = ?1 AND root_path = ?2",
+                params![volume_id as i64, root.to_string_lossy()],
+                |row| {
+                    Ok(VolumeCheckpoint {
+                        volume_id,
+                        root: root.to_path_buf(),
+                        stream_identity: row.get(0)?,
+                        event_id: row.get::<_, i64>(1)? as u64,
+                        generation: row.get::<_, i64>(2)? as u64,
+                    })
+                },
+            )
+            .optional()
     }
 
     pub fn latest_committed(&self) -> rusqlite::Result<Option<CommittedIndex>> {
@@ -238,6 +305,14 @@ CREATE TABLE IF NOT EXISTS recent_opens (
     entry_id INTEGER PRIMARY KEY,
     opened_ns INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS volume_checkpoints (
+    volume_id INTEGER NOT NULL,
+    root_path TEXT NOT NULL,
+    stream_identity TEXT NOT NULL,
+    event_id INTEGER NOT NULL,
+    generation INTEGER NOT NULL REFERENCES scan_generations(generation),
+    PRIMARY KEY (volume_id, root_path)
+);
 ";
 
 #[cfg(test)]
@@ -308,5 +383,55 @@ mod tests {
         assert!(reopened.recent_opens().unwrap().contains_key(&42));
         reopened.clear_open_history().unwrap();
         assert!(reopened.recent_opens().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconciliation_commits_generation_and_checkpoint_together() {
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("first.txt"), "first").unwrap();
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        let mut store = IndexStore::open(&database).unwrap();
+        let report = scan_root(fixture.path()).unwrap();
+        let generation = store
+            .commit_reconciliation(&report, "volume-identity", 42)
+            .unwrap();
+
+        let checkpoint = store
+            .checkpoint(report.volume_id, fixture.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.event_id, 42);
+        assert_eq!(checkpoint.generation, generation);
+        assert_eq!(checkpoint.stream_identity, "volume-identity");
+    }
+
+    #[test]
+    fn failed_reconciliation_does_not_advance_checkpoint() {
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("first.txt"), "first").unwrap();
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        let mut store = IndexStore::open(&database).unwrap();
+        let first = scan_root(fixture.path()).unwrap();
+        store
+            .commit_reconciliation(&first, "volume-identity", 7)
+            .unwrap();
+
+        let mut invalid = scan_root(fixture.path()).unwrap();
+        invalid.entries.push(invalid.entries[0].clone());
+        assert!(
+            store
+                .commit_reconciliation(&invalid, "volume-identity", 99)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .checkpoint(first.volume_id, fixture.path())
+                .unwrap()
+                .unwrap()
+                .event_id,
+            7
+        );
     }
 }
