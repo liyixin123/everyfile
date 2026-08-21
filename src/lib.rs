@@ -1,7 +1,9 @@
+pub mod actions;
 pub mod coordinator;
 pub mod index;
 pub mod model;
 pub mod projection;
+pub mod query;
 pub mod scanner;
 pub mod scheduler;
 pub mod volume;

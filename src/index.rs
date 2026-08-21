@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::{collections::HashMap, time::SystemTime};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -142,6 +143,36 @@ impl IndexStore {
             entries,
         }))
     }
+
+    pub fn record_successful_open(&self, entry_id: u64) -> rusqlite::Result<()> {
+        let opened_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(i64::MAX as u128) as i64;
+        self.connection.execute(
+            "INSERT INTO recent_opens (entry_id, opened_ns) VALUES (?1, ?2)
+             ON CONFLICT(entry_id) DO UPDATE SET opened_ns = excluded.opened_ns",
+            params![entry_id as i64, opened_ns],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_opens(&self) -> rusqlite::Result<HashMap<u64, u64>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT entry_id, opened_ns FROM recent_opens")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect()
+    }
+
+    pub fn clear_open_history(&self) -> rusqlite::Result<()> {
+        self.connection.execute("DELETE FROM recent_opens", [])?;
+        Ok(())
+    }
 }
 
 fn coverage_text(coverage: Coverage) -> &'static str {
@@ -203,6 +234,10 @@ CREATE TABLE IF NOT EXISTS published_roots (
     coverage TEXT NOT NULL CHECK (coverage IN ('complete', 'partial')),
     PRIMARY KEY (volume_id, root_path)
 );
+CREATE TABLE IF NOT EXISTS recent_opens (
+    entry_id INTEGER PRIMARY KEY,
+    opened_ns INTEGER NOT NULL
+);
 ";
 
 #[cfg(test)]
@@ -259,5 +294,19 @@ mod tests {
         assert_eq!(published.generation, first_generation);
         assert_eq!(published.entries.len(), 1);
         assert_eq!(published.entries[0].name, "first.txt");
+    }
+
+    #[test]
+    fn successful_open_history_persists_and_clears() {
+        let data = tempdir().unwrap();
+        let database = data.path().join("index.sqlite3");
+        IndexStore::open(&database)
+            .unwrap()
+            .record_successful_open(42)
+            .unwrap();
+        let reopened = IndexStore::open(&database).unwrap();
+        assert!(reopened.recent_opens().unwrap().contains_key(&42));
+        reopened.clear_open_history().unwrap();
+        assert!(reopened.recent_opens().unwrap().is_empty());
     }
 }

@@ -1,6 +1,7 @@
 #![allow(non_upper_case_globals)]
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -12,20 +13,23 @@ use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSApplication,
     NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSColor, NSControlTextEditingDelegate, NSFloatingWindowLevel, NSFont,
-    NSMenu, NSMenuItem, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSVariableStatusItemLength, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSControl, NSControlTextEditingDelegate, NSEventModifierFlags,
+    NSFloatingWindowLevel, NSFont, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
+    NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength,
+    NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSTimer,
-    NSUserDefaults, ns_string,
+    NSURL, NSUserDefaults, ns_string,
 };
 
+use crate::actions::{ResultAction, ResultActionDispatcher};
 use crate::coordinator::{
     build_first_index_with_progress, configured_root, default_data_directory,
 };
+use crate::index::IndexStore;
 use crate::model::{AppSnapshot, FileIndexState, SearchResult};
 use crate::projection::SearchProjection;
 use crate::scheduler::BackgroundScheduler;
@@ -104,6 +108,7 @@ struct RuntimeIndex {
     state: FileIndexState,
     projection: Option<Arc<SearchProjection>>,
     error: Option<String>,
+    recent_opens: HashMap<u64, u64>,
 }
 
 struct SearchWindowParts {
@@ -129,6 +134,7 @@ impl Default for AppDelegateIvars {
                 state: FileIndexState::NotAvailable,
                 projection: None,
                 error: None,
+                recent_opens: HashMap::new(),
             })),
             results: RefCell::new(Vec::new()),
             hot_key: Cell::new(ptr::null_mut()),
@@ -155,6 +161,7 @@ define_class!(
                 .expect("launch notification must belong to NSApplication");
 
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            app.setMainMenu(Some(&build_main_menu(mtm, self)));
             self.ivars()
                 .scheduler
                 .set(BackgroundScheduler::new(2, 64))
@@ -212,7 +219,39 @@ define_class!(
 
     }
 
-    unsafe impl NSControlTextEditingDelegate for Delegate {}
+    unsafe impl NSControlTextEditingDelegate for Delegate {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            self.run_search();
+        }
+
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        unsafe fn control_command(
+            &self,
+            _control: &NSControl,
+            _text_view: &NSTextView,
+            command_selector: objc2::runtime::Sel,
+        ) -> bool {
+            if command_selector == sel!(insertNewline:) {
+                let modifiers = NSApplication::sharedApplication(self.mtm())
+                    .currentEvent()
+                    .map(|event| event.modifierFlags())
+                    .unwrap_or_else(NSEventModifierFlags::empty);
+                let action = if modifiers.contains(NSEventModifierFlags::Command) {
+                    ResultAction::Reveal
+                } else {
+                    ResultAction::Open
+                };
+                self.dispatch_selected(action)
+            } else if command_selector == sel!(copy:) {
+                self.dispatch_selected(ResultAction::CopyPath)
+            } else {
+                false
+            }
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for Delegate {}
 
     unsafe impl NSTableViewDelegate for Delegate {
         #[unsafe(method_id(tableView:viewForTableColumn:row:))]
@@ -269,6 +308,16 @@ define_class!(
         fn refresh_index_state_action(&self, _timer: Option<&AnyObject>) {
             self.refresh_index_state();
         }
+
+        #[unsafe(method(clearOpenHistory:))]
+        fn clear_open_history_action(&self, _sender: Option<&AnyObject>) {
+            self.clear_open_history();
+        }
+
+        #[unsafe(method(copySelectedPath:))]
+        fn copy_selected_path_action(&self, _sender: Option<&AnyObject>) {
+            self.dispatch_selected(ResultAction::CopyPath);
+        }
     }
 );
 
@@ -319,12 +368,16 @@ impl Delegate {
                             FileIndexState::Rebuilding { scanned_entries };
                     },
                 );
+                let recent_opens = IndexStore::open(&data_directory.join("index.sqlite3"))
+                    .and_then(|store| store.recent_opens())
+                    .unwrap_or_default();
                 let mut runtime = runtime.lock().unwrap();
                 match result {
                     Ok(built) => {
                         runtime.state = built.state;
                         runtime.projection = Some(Arc::new(built.projection));
                         runtime.error = None;
+                        runtime.recent_opens = recent_opens;
                     }
                     Err(error) => {
                         runtime.state = FileIndexState::NotAvailable;
@@ -375,14 +428,62 @@ impl Delegate {
             .get()
             .map(|field| field.stringValue().to_string())
             .unwrap_or_default();
-        let projection = self.ivars().runtime.lock().unwrap().projection.clone();
+        let runtime = self.ivars().runtime.lock().unwrap();
+        let projection = runtime.projection.clone();
+        let recent_opens = runtime.recent_opens.clone();
+        drop(runtime);
         let results = projection
-            .and_then(|projection| projection.search(&query, 100).ok())
+            .and_then(|projection| {
+                projection
+                    .search_with_history(&query, &recent_opens, 100)
+                    .ok()
+            })
             .unwrap_or_default();
         *self.ivars().results.borrow_mut() = results;
         if let Some(table) = self.ivars().table.get() {
             table.reloadData();
         }
+    }
+
+    fn dispatch_selected(&self, action: ResultAction) -> bool {
+        let results = self.ivars().results.borrow();
+        if results.is_empty() {
+            return false;
+        }
+        let selected_row = self
+            .ivars()
+            .table
+            .get()
+            .map(|table| table.selectedRow())
+            .unwrap_or(-1);
+        let index = usize::try_from(selected_row)
+            .unwrap_or(0)
+            .min(results.len() - 1);
+        let result = results[index].clone();
+        drop(results);
+
+        let succeeded = MacResultActionDispatcher.dispatch(action, &result);
+        if succeeded
+            && action == ResultAction::Open
+            && let Ok(store) = IndexStore::open(&default_data_directory().join("index.sqlite3"))
+            && store.record_successful_open(result.entry_id).is_ok()
+        {
+            self.ivars()
+                .runtime
+                .lock()
+                .unwrap()
+                .recent_opens
+                .insert(result.entry_id, current_time_ns());
+        }
+        succeeded
+    }
+
+    fn clear_open_history(&self) {
+        if let Ok(store) = IndexStore::open(&default_data_directory().join("index.sqlite3")) {
+            let _ = store.clear_open_history();
+        }
+        self.ivars().runtime.lock().unwrap().recent_opens.clear();
+        self.run_search();
     }
 
     fn show_shortcut_settings(&self) {
@@ -488,6 +589,35 @@ unsafe fn install_hot_key_handler(delegate: &Delegate) {
     assert_eq!(status, 0, "failed to install global hot-key handler");
 }
 
+struct MacResultActionDispatcher;
+
+impl ResultActionDispatcher for MacResultActionDispatcher {
+    fn dispatch(&mut self, action: ResultAction, result: &SearchResult) -> bool {
+        let path = objc2_foundation::NSString::from_str(&result.path.to_string_lossy());
+        match action {
+            ResultAction::Open => {
+                let url = NSURL::fileURLWithPath(&path);
+                NSWorkspace::sharedWorkspace().openURL(&url)
+            }
+            ResultAction::Reveal => NSWorkspace::sharedWorkspace()
+                .selectFile_inFileViewerRootedAtPath(Some(&path), ns_string!("")),
+            ResultAction::CopyPath => {
+                let pasteboard = NSPasteboard::generalPasteboard();
+                pasteboard.clearContents();
+                pasteboard.setString_forType(&path, unsafe { NSPasteboardTypeString })
+            }
+        }
+    }
+}
+
+fn current_time_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
 fn build_search_window(
     mtm: MainThreadMarker,
     snapshot: &AppSnapshot,
@@ -530,10 +660,7 @@ fn build_search_window(
     search.setPlaceholderString(Some(ns_string!("Search file names and paths")));
     search.setFont(Some(&NSFont::systemFontOfSize(22.0)));
     search.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-    unsafe {
-        search.setTarget(Some(delegate));
-        search.setAction(Some(sel!(runSearch:)));
-    }
+    unsafe { search.setDelegate(Some(ProtocolObject::from_ref(delegate))) };
 
     let table_frame = NSRect::new(NSPoint::new(24.0, 24.0), NSSize::new(712.0, 330.0));
     let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), table_frame);
@@ -655,6 +782,15 @@ fn build_status_item(
         ns_string!(","),
         true,
     );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Clear Open History"),
+        sel!(clearOpenHistory:),
+        ns_string!(""),
+        true,
+    );
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_menu_item(
         mtm,
@@ -667,6 +803,24 @@ fn build_status_item(
     );
     status_item.setMenu(Some(&menu));
     (status_item, state)
+}
+
+fn build_main_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMenu> {
+    let main_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Everyfile"));
+    let edit_item = NSMenuItem::new(mtm);
+    let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+    add_menu_item(
+        mtm,
+        &edit_menu,
+        delegate,
+        ns_string!("Copy Path"),
+        sel!(copySelectedPath:),
+        ns_string!("c"),
+        true,
+    );
+    edit_item.setSubmenu(Some(&edit_menu));
+    main_menu.addItem(&edit_item);
+    main_menu
 }
 
 fn add_menu_item(
