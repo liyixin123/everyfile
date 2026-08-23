@@ -31,7 +31,15 @@ pub fn scan_root_with_progress(
     root: &Path,
     progress: impl FnMut(u64),
 ) -> std::io::Result<ScanReport> {
-    scan_root_with_policy(root, progress, |_, _| None)
+    scan_root_with_progress_excluding(root, progress, &[])
+}
+
+pub fn scan_root_with_progress_excluding(
+    root: &Path,
+    progress: impl FnMut(u64),
+    excluded_roots: &[PathBuf],
+) -> std::io::Result<ScanReport> {
+    scan_root_with_policy(root, progress, excluded_roots, |_, _| None)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +51,7 @@ enum ScanOperation {
 fn scan_root_with_policy(
     root: &Path,
     mut progress: impl FnMut(u64),
+    excluded_roots: &[PathBuf],
     mut denied: impl FnMut(&Path, ScanOperation) -> Option<std::io::Error>,
 ) -> std::io::Result<ScanReport> {
     let root_metadata = fs::symlink_metadata(root)?;
@@ -77,6 +86,12 @@ fn scan_root_with_policy(
                 }
             };
             let path = child.path();
+            if excluded_roots
+                .iter()
+                .any(|excluded| path.starts_with(excluded))
+            {
+                continue;
+            }
             let metadata = match denied(&path, ScanOperation::Metadata)
                 .map_or_else(|| fs::symlink_metadata(&path), Err)
             {
@@ -183,6 +198,33 @@ mod tests {
     }
 
     #[test]
+    fn excludes_application_data_without_reducing_coverage() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("Library/Application Support/Everyfile");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("index.sqlite3"), "private index").unwrap();
+        fs::write(root.path().join("visible.txt"), "visible").unwrap();
+
+        let report =
+            scan_root_with_progress_excluding(root.path(), |_| {}, std::slice::from_ref(&data))
+                .unwrap();
+
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.name == "visible.txt")
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|entry| !entry.path.starts_with(&data))
+        );
+        assert_eq!(report.coverage(), Coverage::Complete);
+    }
+
+    #[test]
     fn hidden_entries_are_indexed_and_application_packages_are_atomic() {
         let root = tempdir().unwrap();
         fs::write(root.path().join(".hidden-note"), "hidden").unwrap();
@@ -234,6 +276,7 @@ mod tests {
         let report = scan_root_with_policy(
             root.path(),
             |_| {},
+            &[],
             |path, operation| {
                 (path.ends_with("denied") && operation == ScanOperation::Enumerate).then(|| {
                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied")
@@ -267,6 +310,7 @@ mod tests {
         let report = scan_root_with_policy(
             root.path(),
             |_| {},
+            &[],
             |path, operation| {
                 (path.ends_with("denied.txt") && operation == ScanOperation::Metadata).then(|| {
                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, "metadata denied")

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::index::IndexStore;
 use crate::model::{Coverage, FileIndexState, RootCoverage};
 use crate::projection::SearchProjection;
-use crate::scanner::scan_root_with_progress;
+use crate::scanner::scan_root_with_progress_excluding;
 use crate::volume::{discover_mounted_volumes, volume_containing};
 
 pub struct BuiltIndex {
@@ -54,6 +54,10 @@ pub fn build_first_index_with_progress(
             .enabled_projection_generation()
             .map_err(|error| error.to_string())?;
         let projection = SearchProjection::open(&projection_path, expected_generation)
+            // A valid older projection is still a committed, searchable
+            // snapshot. Publish it immediately; FSEvents reconciliation will
+            // replace it with the current generation in the background.
+            .or_else(|_| SearchProjection::open(&projection_path, None))
             .or_else(|_| SearchProjection::build_from_store(&projection_path, &store))
             .map_err(|error| error.to_string())?;
         return Ok(BuiltIndex {
@@ -66,8 +70,12 @@ pub fn build_first_index_with_progress(
         });
     }
 
-    let report =
-        scan_root_with_progress(&canonical_root, progress).map_err(|error| error.to_string())?;
+    let report = scan_root_with_progress_excluding(
+        &canonical_root,
+        progress,
+        &[data_directory.to_path_buf()],
+    )
+    .map_err(|error| error.to_string())?;
     #[cfg(target_os = "macos")]
     let commit = crate::fsevents::stream_identity(&canonical_root).and_then(|identity| {
         store
@@ -131,6 +139,7 @@ pub fn coverage_for_skips(skip_count: usize) -> Coverage {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
 
     use tempfile::tempdir;
 
@@ -174,6 +183,33 @@ mod tests {
         let restarted = build_first_index(root.path(), data.path()).unwrap();
         assert_eq!(
             restarted.projection.search("everyfile", 100).unwrap().len(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restart_publishes_a_valid_older_projection_before_catching_up() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("searchable.txt"), "fixture").unwrap();
+        let data = tempdir().unwrap();
+        let built = build_first_index(root.path(), data.path()).unwrap();
+        assert_ne!(built.projection.generation(), 0);
+        drop(built);
+
+        let projection_path = data.path().join("search.projection");
+        let mut projection = fs::OpenOptions::new()
+            .write(true)
+            .open(&projection_path)
+            .unwrap();
+        projection.seek(SeekFrom::Start(12)).unwrap();
+        projection.write_all(&0_u64.to_le_bytes()).unwrap();
+        projection.sync_all().unwrap();
+
+        let restarted = build_first_index(root.path(), data.path()).unwrap();
+        assert_eq!(restarted.projection.generation(), 0);
+        assert_eq!(
+            restarted.projection.search("searchable", 10).unwrap().len(),
             1
         );
     }

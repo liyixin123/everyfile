@@ -613,8 +613,12 @@ impl Delegate {
         let runtime = Arc::clone(&self.ivars().runtime);
         let user_paused = Arc::clone(&self.ivars().user_paused);
         let resource_root = root.clone();
-        runtime.lock().unwrap().state = FileIndexState::Rebuilding { scanned_entries: 0 };
         let data_directory = default_data_directory();
+        let has_existing_index = data_directory.join("index.sqlite3").exists()
+            && data_directory.join("search.projection").exists();
+        if !has_existing_index {
+            runtime.lock().unwrap().state = FileIndexState::Rebuilding { scanned_entries: 0 };
+        }
         let schedule_result = self
             .ivars()
             .scheduler
@@ -713,7 +717,7 @@ impl Delegate {
                     FileIndexState::Rebuilding { scanned_entries } => {
                         format!("正在建立索引 · 已扫描 {} 项", format_count(scanned_entries))
                     }
-                    _ => "正在建立索引".to_owned(),
+                    _ => "正在加载索引".to_owned(),
                 },
             }
         };
@@ -871,8 +875,18 @@ impl Delegate {
             .as_ref()
             .map(|receiver| receiver.try_iter().collect())
             .unwrap_or_default();
-        for batch in batches {
-            self.ivars().event_hints.borrow_mut().push(batch);
+        let data_directory = default_data_directory();
+        for mut batch in batches {
+            batch
+                .paths
+                .retain(|path| !path.starts_with(&data_directory));
+            if !batch.paths.is_empty()
+                || batch.history_lost
+                || batch.ids_wrapped
+                || batch.root_changed
+            {
+                self.ivars().event_hints.borrow_mut().push(batch);
+            }
         }
         if !self.ivars().event_hints.borrow().has_pending() {
             return;
