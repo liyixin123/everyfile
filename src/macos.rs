@@ -13,14 +13,15 @@ use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertThirdButtonReturn,
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSColor, NSControl, NSControlTextEditingDelegate, NSEventModifierFlags,
-    NSFloatingWindowLevel, NSFont, NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem,
-    NSPasteboard, NSPasteboardTypeString, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn,
-    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldDelegate,
-    NSTextView, NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask,
-    NSWorkspace, NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification,
+    NSAppearance, NSAppearanceNameDarkAqua, NSApplication, NSApplicationActivationPolicy,
+    NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
+    NSControl, NSControlTextEditingDelegate, NSEventModifierFlags, NSFloatingWindowLevel, NSFont,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView,
+    NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification,
     NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
@@ -409,7 +410,7 @@ define_class!(
                     .created_ns
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
-                "size" => result.size.to_string(),
+                "size" => human_file_size(result.size),
                 _ => String::new(),
             };
             let label = NSTextField::labelWithString(
@@ -417,7 +418,12 @@ define_class!(
                 self.mtm(),
             );
             label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-            label.setTextColor(Some(&NSColor::labelColor()));
+            let color = if identifier == "path" {
+                NSColor::secondaryLabelColor()
+            } else {
+                NSColor::labelColor()
+            };
+            label.setTextColor(Some(&color));
             label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
             Some(label.into_super().into_super())
         }
@@ -490,6 +496,11 @@ define_class!(
         #[unsafe(method(sortByCreationTime:))]
         fn sort_by_creation_time_action(&self, _sender: Option<&AnyObject>) {
             self.select_sort(SortField::CreationTime);
+        }
+
+        #[unsafe(method(toggleSortDirection:))]
+        fn toggle_sort_direction_action(&self, _sender: Option<&AnyObject>) {
+            self.select_sort(self.ivars().sort.get().field);
         }
 
         #[unsafe(method(useResponsiveIndexing:))]
@@ -662,12 +673,13 @@ impl Delegate {
         }
         let paused = self.ivars().user_paused.load(Ordering::Acquire);
         let title = if paused {
-            "File Index: Paused"
+            "索引已暂停"
         } else {
             match runtime.freshness {
-                Freshness::CatchingUp => "File Index: Catching Up",
-                Freshness::Offline => "File Index: Offline",
-                _ => runtime.state.title(),
+                Freshness::CatchingUp => "正在补齐索引 · 结果可用",
+                Freshness::Offline => "索引离线",
+                Freshness::Current => "●  索引已更新",
+                Freshness::Rebuilding => "正在建立索引",
             }
         };
         let coverage = overall_coverage(&runtime.coverage_reports);
@@ -698,11 +710,12 @@ impl Delegate {
             }
             *self.ivars().state_title_cache.borrow_mut() = Some(title.to_owned());
         }
-        if self.ivars().state_detail_cache.borrow().as_deref() != Some(detail.as_str()) {
+        let result_count = format!("{} 个结果", self.ivars().exact_total.get());
+        if self.ivars().state_detail_cache.borrow().as_deref() != Some(result_count.as_str()) {
             if let Some(label) = self.ivars().state_detail.get() {
-                label.setStringValue(&objc2_foundation::NSString::from_str(&detail));
+                label.setStringValue(&objc2_foundation::NSString::from_str(&result_count));
             }
-            *self.ivars().state_detail_cache.borrow_mut() = Some(detail.clone());
+            *self.ivars().state_detail_cache.borrow_mut() = Some(result_count);
         }
         if let Some(item) = self.ivars().status_state_item.get() {
             let coverage_title = match coverage {
@@ -1546,12 +1559,34 @@ fn current_time_ns() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn human_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    match bytes {
+        0 => "—".into(),
+        1..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{:.0} KB", bytes as f64 / KB),
+        1_048_576..=1_073_741_823 => format!("{:.1} MB", bytes as f64 / MB),
+        _ => format!("{:.1} GB", bytes as f64 / GB),
+    }
+}
+
 fn build_search_window(
     mtm: MainThreadMarker,
     snapshot: &AppSnapshot,
     delegate: &Delegate,
 ) -> SearchWindowParts {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(760.0, 460.0));
+    // The reference is explicitly dark regardless of the system appearance.
+    // Fixing the app appearance also keeps native controls and table selection
+    // colors consistent with the HTML prototype.
+    let dark_appearance = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua });
+    NSApplication::sharedApplication(mtm).setAppearance(dark_appearance.as_deref());
+
+    // Variant A is deliberately a wide, dense utility window. Keep these
+    // dimensions in points: the prototype's 1060 CSS pixels map 1:1 to AppKit
+    // points (and therefore to 2120 pixels on a Retina display).
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1060.0, 610.0));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -1570,6 +1605,7 @@ fn build_search_window(
     window.setLevel(NSFloatingWindowLevel);
     window.setOpaque(false);
     window.setBackgroundColor(Some(&NSColor::clearColor()));
+    window.setMinSize(NSSize::new(820.0, 460.0));
     window.center();
 
     let content = NSView::initWithFrame(NSView::alloc(mtm), frame);
@@ -1577,18 +1613,25 @@ fn build_search_window(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
 
-    let search_frame = NSRect::new(NSPoint::new(72.0, 376.0), NSSize::new(616.0, 44.0));
-    let search_content = NSView::initWithFrame(
-        NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), search_frame.size),
-    );
+    let search_frame = NSRect::new(NSPoint::new(0.0, 526.0), NSSize::new(1060.0, 62.0));
+    let search_content = NSView::initWithFrame(NSView::alloc(mtm), search_frame);
+
+    let search_icon = NSTextField::labelWithString(ns_string!("⌕"), mtm);
+    search_icon.setFrame(NSRect::new(
+        NSPoint::new(20.0, 19.0),
+        NSSize::new(24.0, 25.0),
+    ));
+    search_icon.setFont(Some(&NSFont::systemFontOfSize(20.0)));
+    search_icon.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    search_content.addSubview(&search_icon);
+
     let search = NSTextField::textFieldWithString(ns_string!(""), mtm);
     search.setFrame(NSRect::new(
-        NSPoint::new(16.0, 1.0),
-        NSSize::new(584.0, 42.0),
+        NSPoint::new(44.0, 10.0),
+        NSSize::new(900.0, 42.0),
     ));
     search.setPlaceholderString(Some(ns_string!("Search file names and paths")));
-    search.setFont(Some(&NSFont::systemFontOfSize(18.0)));
+    search.setFont(Some(&NSFont::systemFontOfSize(22.0)));
     search.setTextColor(Some(&NSColor::labelColor()));
     search.setBezeled(false);
     search.setBordered(false);
@@ -1599,33 +1642,76 @@ fn build_search_window(
     );
     unsafe { search.setDelegate(Some(ProtocolObject::from_ref(delegate))) };
     search_content.addSubview(&search);
-    let search_surface = build_glass_surface(
-        mtm,
-        search_frame,
-        NSGlassEffectViewStyle::Clear,
-        20.0,
-        &search_content,
-    );
 
-    let table_frame = NSRect::new(NSPoint::new(24.0, 64.0), NSSize::new(712.0, 288.0));
-    let table_content = NSView::initWithFrame(
+    let shortcut = NSTextField::labelWithString(ns_string!("⌥ Space"), mtm);
+    shortcut.setFrame(NSRect::new(
+        NSPoint::new(970.0, 21.0),
+        NSSize::new(72.0, 21.0),
+    ));
+    shortcut.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    shortcut.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    shortcut.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    search_content.addSubview(&shortcut);
+
+    let toolbar = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
+        NSRect::new(NSPoint::new(0.0, 476.0), NSSize::new(1060.0, 50.0)),
     );
+    let sort_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("相关性 ⌄"),
+            Some(delegate),
+            Some(sel!(sortByRelevance:)),
+            mtm,
+        )
+    };
+    sort_button.setFrame(NSRect::new(
+        NSPoint::new(12.0, 9.0),
+        NSSize::new(92.0, 32.0),
+    ));
+    toolbar.addSubview(&sort_button);
+    let direction_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("降序 ↕"),
+            Some(delegate),
+            Some(sel!(toggleSortDirection:)),
+            mtm,
+        )
+    };
+    direction_button.setFrame(NSRect::new(
+        NSPoint::new(112.0, 9.0),
+        NSSize::new(78.0, 32.0),
+    ));
+    toolbar.addSubview(&direction_button);
+    let hidden_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("隐藏项目：显示  ⌘⇧."),
+            Some(delegate),
+            Some(sel!(toggleHiddenResults:)),
+            mtm,
+        )
+    };
+    hidden_button.setFrame(NSRect::new(
+        NSPoint::new(198.0, 9.0),
+        NSSize::new(170.0, 32.0),
+    ));
+    toolbar.addSubview(&hidden_button);
+
+    let table_frame = NSRect::new(NSPoint::new(0.0, 34.0), NSSize::new(1060.0, 442.0));
+    let table_content = NSView::initWithFrame(NSView::alloc(mtm), table_frame);
     let table = NSTableView::initWithFrame(
         NSTableView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
     );
-    table.setRowHeight(28.0);
+    table.setRowHeight(31.0);
     table.setUsesAlternatingRowBackgroundColors(false);
     table.setBackgroundColor(&NSColor::clearColor());
     table.setGridStyleMask(objc2_app_kit::NSTableViewGridLineStyle::empty());
-    table.setIntercellSpacing(NSSize::new(0.0, 4.0));
-    add_table_column(mtm, &table, "name", "Name", 150.0);
-    add_table_column(mtm, &table, "path", "Path", 260.0);
-    add_table_column(mtm, &table, "modified", "Modified", 100.0);
-    add_table_column(mtm, &table, "created", "Created", 100.0);
-    add_table_column(mtm, &table, "size", "Size", 70.0);
+    table.setIntercellSpacing(NSSize::new(0.0, 0.0));
+    add_table_column(mtm, &table, "name", "名称", 270.0);
+    add_table_column(mtm, &table, "path", "路径", 570.0);
+    add_table_column(mtm, &table, "modified", "修改时间", 130.0);
+    add_table_column(mtm, &table, "size", "大小", 90.0);
     unsafe {
         table.setDataSource(Some(ProtocolObject::from_ref(delegate)));
         table.setDelegate(Some(ProtocolObject::from_ref(delegate)));
@@ -1643,25 +1729,17 @@ fn build_search_window(
     );
     scroll.setDocumentView(Some(&table));
     table_content.addSubview(&scroll);
-    let table_surface = build_glass_surface(
-        mtm,
-        table_frame,
-        NSGlassEffectViewStyle::Regular,
-        22.0,
-        &table_content,
-    );
-
     let status_title = NSTextField::labelWithString(
         objc2_foundation::NSString::from_str(snapshot.file_index.title()).as_ref(),
         mtm,
     );
     status_title.setFrame(NSRect::new(
-        NSPoint::new(24.0, 39.0),
-        NSSize::new(712.0, 16.0),
+        NSPoint::new(830.0, 9.0),
+        NSSize::new(210.0, 17.0),
     ));
     status_title.setFont(Some(&NSFont::systemFontOfSize(12.0)));
     status_title.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    status_title.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    status_title.setAlignment(objc2_app_kit::NSTextAlignment::Right);
     status_title.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
@@ -1671,22 +1749,23 @@ fn build_search_window(
         mtm,
     );
     status_detail.setFrame(NSRect::new(
-        NSPoint::new(24.0, 22.0),
-        NSSize::new(712.0, 14.0),
+        NSPoint::new(12.0, 9.0),
+        NSSize::new(300.0, 17.0),
     ));
     status_detail.setFont(Some(&NSFont::systemFontOfSize(11.0)));
     status_detail.setTextColor(Some(&NSColor::tertiaryLabelColor()));
-    status_detail.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    status_detail.setAlignment(objc2_app_kit::NSTextAlignment::Left);
     status_detail.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
 
-    content.addSubview(&search_surface);
-    content.addSubview(&table_surface);
+    content.addSubview(&search_content);
+    content.addSubview(&toolbar);
+    content.addSubview(&table_content);
     content.addSubview(&status_title);
     content.addSubview(&status_detail);
     let outer_surface =
-        build_glass_surface(mtm, frame, NSGlassEffectViewStyle::Regular, 28.0, &content);
+        build_glass_surface(mtm, frame, NSGlassEffectViewStyle::Regular, 12.0, &content);
     outer_surface.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
