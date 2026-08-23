@@ -9,18 +9,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertThirdButtonReturn,
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSColor, NSControl, NSControlTextEditingDelegate, NSEventModifierFlags,
-    NSFloatingWindowLevel, NSFont, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
-    NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
-    NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength,
-    NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidMountNotification,
-    NSWorkspaceDidUnmountNotification, NSWorkspaceDidWakeNotification,
+    NSFloatingWindowLevel, NSFont, NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem,
+    NSPasteboard, NSPasteboardTypeString, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn,
+    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldDelegate,
+    NSTextView, NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask,
+    NSWorkspace, NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification,
+    NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo,
@@ -411,6 +412,9 @@ define_class!(
                 &objc2_foundation::NSString::from_str(&value),
                 self.mtm(),
             );
+            label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            label.setTextColor(Some(&NSColor::labelColor()));
+            label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
             Some(label.into_super().into_super())
         }
     }
@@ -1558,29 +1562,55 @@ fn build_search_window(
     window.setBackgroundColor(Some(&NSColor::clearColor()));
     window.center();
 
-    let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
-    effect.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
-    effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
-    effect.setState(NSVisualEffectState::FollowsWindowActiveState);
-    effect.setAutoresizingMask(
+    let content = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    content.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
 
+    let search_frame = NSRect::new(NSPoint::new(72.0, 376.0), NSSize::new(616.0, 44.0));
+    let search_content = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), search_frame.size),
+    );
     let search = NSTextField::textFieldWithString(ns_string!(""), mtm);
     search.setFrame(NSRect::new(
-        NSPoint::new(24.0, 380.0),
-        NSSize::new(712.0, 42.0),
+        NSPoint::new(16.0, 1.0),
+        NSSize::new(584.0, 42.0),
     ));
     search.setPlaceholderString(Some(ns_string!("Search file names and paths")));
-    search.setFont(Some(&NSFont::systemFontOfSize(22.0)));
-    search.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    search.setFont(Some(&NSFont::systemFontOfSize(18.0)));
+    search.setTextColor(Some(&NSColor::labelColor()));
+    search.setBezeled(false);
+    search.setBordered(false);
+    search.setDrawsBackground(false);
+    search.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
+    search.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
     unsafe { search.setDelegate(Some(ProtocolObject::from_ref(delegate))) };
+    search_content.addSubview(&search);
+    let search_surface = build_glass_surface(
+        mtm,
+        search_frame,
+        NSGlassEffectViewStyle::Clear,
+        20.0,
+        &search_content,
+    );
 
-    let table_frame = NSRect::new(NSPoint::new(24.0, 24.0), NSSize::new(712.0, 330.0));
-    let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), table_frame);
-    table.setRowHeight(24.0);
+    let table_frame = NSRect::new(NSPoint::new(24.0, 64.0), NSSize::new(712.0, 288.0));
+    let table_content = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
+    );
+    let table = NSTableView::initWithFrame(
+        NSTableView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
+    );
+    table.setRowHeight(28.0);
     table.setUsesAlternatingRowBackgroundColors(false);
     table.setBackgroundColor(&NSColor::clearColor());
+    table.setGridStyleMask(objc2_app_kit::NSTableViewGridLineStyle::empty());
+    table.setIntercellSpacing(NSSize::new(0.0, 4.0));
     add_table_column(mtm, &table, "name", "Name", 150.0);
     add_table_column(mtm, &table, "path", "Path", 260.0);
     add_table_column(mtm, &table, "modified", "Modified", 100.0);
@@ -1591,50 +1621,113 @@ fn build_search_window(
         table.setDelegate(Some(ProtocolObject::from_ref(delegate)));
     }
 
-    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), table_frame);
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
+    );
     scroll.setDrawsBackground(false);
+    scroll.setBackgroundColor(&NSColor::clearColor());
     scroll.setHasVerticalScroller(false);
     scroll.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     scroll.setDocumentView(Some(&table));
+    table_content.addSubview(&scroll);
+    let table_surface = build_glass_surface(
+        mtm,
+        table_frame,
+        NSGlassEffectViewStyle::Regular,
+        22.0,
+        &table_content,
+    );
 
-    let empty_title = NSTextField::labelWithString(
+    let status_title = NSTextField::labelWithString(
         objc2_foundation::NSString::from_str(snapshot.file_index.title()).as_ref(),
         mtm,
     );
-    empty_title.setFrame(NSRect::new(
-        NSPoint::new(24.0, 210.0),
-        NSSize::new(712.0, 32.0),
+    status_title.setFrame(NSRect::new(
+        NSPoint::new(24.0, 39.0),
+        NSSize::new(712.0, 16.0),
     ));
-    empty_title.setFont(Some(&NSFont::systemFontOfSize(20.0)));
-    empty_title.setAlignment(objc2_app_kit::NSTextAlignment::Center);
-    empty_title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    status_title.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    status_title.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    status_title.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    status_title.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
 
-    let empty_detail = NSTextField::labelWithString(
+    let status_detail = NSTextField::labelWithString(
         objc2_foundation::NSString::from_str(&snapshot.file_index.detail()).as_ref(),
         mtm,
     );
-    empty_detail.setFrame(NSRect::new(
-        NSPoint::new(24.0, 180.0),
-        NSSize::new(712.0, 24.0),
+    status_detail.setFrame(NSRect::new(
+        NSPoint::new(24.0, 22.0),
+        NSSize::new(712.0, 14.0),
     ));
-    empty_detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    empty_detail.setAlignment(objc2_app_kit::NSTextAlignment::Center);
-    empty_detail.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    status_detail.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    status_detail.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+    status_detail.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    status_detail.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
 
-    effect.addSubview(&search);
-    effect.addSubview(&scroll);
-    effect.addSubview(&empty_title);
-    effect.addSubview(&empty_detail);
-    window.setContentView(Some(&effect));
+    content.addSubview(&search_surface);
+    content.addSubview(&table_surface);
+    content.addSubview(&status_title);
+    content.addSubview(&status_detail);
+    let outer_surface =
+        build_glass_surface(mtm, frame, NSGlassEffectViewStyle::Regular, 28.0, &content);
+    outer_surface.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    window.setContentView(Some(&outer_surface));
     SearchWindowParts {
         window,
         search_field: search,
         table,
-        state_title: empty_title,
-        state_detail: empty_detail,
+        state_title: status_title,
+        state_detail: status_detail,
     }
+}
+
+fn build_glass_surface(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    style: NSGlassEffectViewStyle,
+    corner_radius: f64,
+    content_view: &NSView,
+) -> Retained<NSView> {
+    // NSGlassEffectView is macOS 26's native Liquid Glass surface. Resolve the
+    // class dynamically so the existing macOS 15 deployment target keeps its
+    // visual-effect fallback instead of taking a hard class-link dependency.
+    if let Some(class) = AnyClass::get(c"NSGlassEffectView") {
+        let glass: Retained<NSGlassEffectView> = unsafe {
+            let allocated: objc2::rc::Allocated<NSGlassEffectView> = msg_send![class, alloc];
+            NSGlassEffectView::initWithFrame(allocated, frame)
+        };
+        glass.setStyle(style);
+        glass.setCornerRadius(corner_radius);
+        let tint = if style == NSGlassEffectViewStyle::Clear {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.28, 0.46, 0.18)
+        } else {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.18, 0.32, 0.28)
+        };
+        glass.setTintColor(Some(&tint));
+        glass.setContentView(Some(content_view));
+        return glass.into_super();
+    }
+
+    let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
+    effect.setMaterial(if style == NSGlassEffectViewStyle::Clear {
+        NSVisualEffectMaterial::Popover
+    } else {
+        NSVisualEffectMaterial::HUDWindow
+    });
+    effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    effect.setState(NSVisualEffectState::FollowsWindowActiveState);
+    effect.setAlphaValue(0.96);
+    effect.addSubview(content_view);
+    effect.into_super()
 }
 
 fn add_table_column(
@@ -1646,9 +1739,14 @@ fn add_table_column(
 ) {
     let identifier = objc2_foundation::NSString::from_str(identifier);
     let column = NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), &identifier);
-    column
-        .headerCell()
-        .setStringValue(&objc2_foundation::NSString::from_str(title));
+    let header = column.headerCell();
+    header.setStringValue(&objc2_foundation::NSString::from_str(title));
+    header.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    header.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    header.setBackgroundColor(Some(&NSColor::clearColor()));
+    header.setDrawsBackground(false);
+    header.setBezeled(false);
+    header.setBordered(false);
     column.setWidth(width);
     column.setMinWidth(60.0);
     table.addTableColumn(&column);
