@@ -25,8 +25,9 @@ use objc2_app_kit::{
     NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo,
-    NSProcessInfoThermalState, NSRect, NSSize, NSTimer, NSURL, NSUserDefaults, ns_string,
+    MainThreadMarker, NSDate, NSDateFormatter, NSDateFormatterStyle, NSNotification, NSObject,
+    NSObjectProtocol, NSPoint, NSProcessInfo, NSProcessInfoThermalState, NSRect, NSSize, NSTimer,
+    NSURL, NSUserDefaults, ns_string,
 };
 
 use crate::actions::{ResultAction, ResultActionDispatcher};
@@ -112,6 +113,7 @@ struct AppDelegateIvars {
     table: OnceCell<Retained<NSTableView>>,
     state_title: OnceCell<Retained<NSTextField>>,
     state_detail: OnceCell<Retained<NSTextField>>,
+    date_formatter: OnceCell<Retained<NSDateFormatter>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
     status_state_item: OnceCell<Retained<NSMenuItem>>,
     skipped_locations_item: OnceCell<Retained<NSMenuItem>>,
@@ -177,6 +179,7 @@ impl Default for AppDelegateIvars {
             table: OnceCell::new(),
             state_title: OnceCell::new(),
             state_detail: OnceCell::new(),
+            date_formatter: OnceCell::new(),
             status_item: OnceCell::new(),
             status_state_item: OnceCell::new(),
             skipped_locations_item: OnceCell::new(),
@@ -402,14 +405,14 @@ define_class!(
             let value = match identifier.as_str() {
                 "name" => result.name.clone(),
                 "path" => result.path.to_string_lossy().into_owned(),
-                "modified" => result
-                    .modified_ns
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                "created" => result
-                    .created_ns
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
+                "modified" => format_file_time(
+                    &self.ivars().date_formatter,
+                    result.modified_ns,
+                ),
+                "created" => format_file_time(
+                    &self.ivars().date_formatter,
+                    result.created_ns,
+                ),
                 "size" => human_file_size(result.size),
                 _ => String::new(),
             };
@@ -1575,6 +1578,24 @@ fn human_file_size(bytes: u64) -> String {
         1_048_576..=1_073_741_823 => format!("{:.1} MB", bytes as f64 / MB),
         _ => format!("{:.1} GB", bytes as f64 / GB),
     }
+}
+
+fn format_file_time(
+    formatter: &OnceCell<Retained<NSDateFormatter>>,
+    nanoseconds_since_epoch: Option<i64>,
+) -> String {
+    let Some(nanoseconds) = nanoseconds_since_epoch else {
+        return "—".into();
+    };
+    let formatter = formatter.get_or_init(|| {
+        let formatter = NSDateFormatter::new();
+        formatter.setDateStyle(NSDateFormatterStyle::MediumStyle);
+        formatter.setTimeStyle(NSDateFormatterStyle::ShortStyle);
+        formatter.setDoesRelativeDateFormatting(true);
+        formatter
+    });
+    let date = NSDate::dateWithTimeIntervalSince1970(nanoseconds as f64 / 1_000_000_000.0);
+    formatter.stringFromDate(&date).to_string()
 }
 
 fn format_count(value: u64) -> String {
