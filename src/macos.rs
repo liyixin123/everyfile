@@ -673,13 +673,18 @@ impl Delegate {
         }
         let paused = self.ivars().user_paused.load(Ordering::Acquire);
         let title = if paused {
-            "索引已暂停"
+            "索引已暂停".to_owned()
         } else {
             match runtime.freshness {
-                Freshness::CatchingUp => "正在补齐索引 · 结果可用",
-                Freshness::Offline => "索引离线",
-                Freshness::Current => "●  索引已更新",
-                Freshness::Rebuilding => "正在建立索引",
+                Freshness::CatchingUp => "正在补齐索引 · 结果可用".to_owned(),
+                Freshness::Offline => "索引离线".to_owned(),
+                Freshness::Current => "●  索引已更新".to_owned(),
+                Freshness::Rebuilding => match runtime.state {
+                    FileIndexState::Rebuilding { scanned_entries } => {
+                        format!("正在建立索引 · 已扫描 {} 项", format_count(scanned_entries))
+                    }
+                    _ => "正在建立索引".to_owned(),
+                },
             }
         };
         let coverage = overall_coverage(&runtime.coverage_reports);
@@ -704,11 +709,11 @@ impl Delegate {
                 runtime.state.detail()
             }
         });
-        if self.ivars().state_title_cache.borrow().as_deref() != Some(title) {
+        if self.ivars().state_title_cache.borrow().as_deref() != Some(title.as_str()) {
             if let Some(label) = self.ivars().state_title.get() {
-                label.setStringValue(&objc2_foundation::NSString::from_str(title));
+                label.setStringValue(&objc2_foundation::NSString::from_str(&title));
             }
-            *self.ivars().state_title_cache.borrow_mut() = Some(title.to_owned());
+            *self.ivars().state_title_cache.borrow_mut() = Some(title.clone());
         }
         let result_count = format!("{} 个结果", self.ivars().exact_total.get());
         if self.ivars().state_detail_cache.borrow().as_deref() != Some(result_count.as_str()) {
@@ -1572,6 +1577,18 @@ fn human_file_size(bytes: u64) -> String {
     }
 }
 
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    formatted
+}
+
 fn build_search_window(
     mtm: MainThreadMarker,
     snapshot: &AppSnapshot,
@@ -2112,4 +2129,17 @@ pub fn run() {
     let delegate = Delegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     app.run();
+}
+
+#[cfg(test)]
+mod ui_format_tests {
+    use super::format_count;
+
+    #[test]
+    fn index_progress_groups_scanned_entry_count() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(12_345), "12,345");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
 }
