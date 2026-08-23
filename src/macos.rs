@@ -17,11 +17,11 @@ use objc2_app_kit::{
     NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
     NSControl, NSControlTextEditingDelegate, NSEventModifierFlags, NSFloatingWindowLevel, NSFont,
     NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem, NSPasteboard,
-    NSPasteboardTypeString, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
-    NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace,
-    NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification,
+    NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn,
+    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldDelegate,
+    NSTextView, NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask,
+    NSWorkspace, NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification,
     NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
@@ -114,6 +114,9 @@ struct AppDelegateIvars {
     state_title: OnceCell<Retained<NSTextField>>,
     state_detail: OnceCell<Retained<NSTextField>>,
     date_formatter: OnceCell<Retained<NSDateFormatter>>,
+    sort_popup: OnceCell<Retained<NSPopUpButton>>,
+    direction_button: OnceCell<Retained<NSButton>>,
+    hidden_button: OnceCell<Retained<NSButton>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
     status_state_item: OnceCell<Retained<NSMenuItem>>,
     skipped_locations_item: OnceCell<Retained<NSMenuItem>>,
@@ -169,6 +172,9 @@ struct SearchWindowParts {
     table: Retained<NSTableView>,
     state_title: Retained<NSTextField>,
     state_detail: Retained<NSTextField>,
+    sort_popup: Retained<NSPopUpButton>,
+    direction_button: Retained<NSButton>,
+    hidden_button: Retained<NSButton>,
 }
 
 impl Default for AppDelegateIvars {
@@ -180,6 +186,9 @@ impl Default for AppDelegateIvars {
             state_title: OnceCell::new(),
             state_detail: OnceCell::new(),
             date_formatter: OnceCell::new(),
+            sort_popup: OnceCell::new(),
+            direction_button: OnceCell::new(),
+            hidden_button: OnceCell::new(),
             status_item: OnceCell::new(),
             status_state_item: OnceCell::new(),
             skipped_locations_item: OnceCell::new(),
@@ -256,6 +265,13 @@ define_class!(
             self.ivars().table.set(parts.table).unwrap();
             self.ivars().state_title.set(parts.state_title).unwrap();
             self.ivars().state_detail.set(parts.state_detail).unwrap();
+            self.ivars().sort_popup.set(parts.sort_popup).unwrap();
+            self.ivars()
+                .direction_button
+                .set(parts.direction_button)
+                .unwrap();
+            self.ivars().hidden_button.set(parts.hidden_button).unwrap();
+            self.sync_search_controls();
             let (status_item, status_state_item, skipped_locations_item) =
                 build_status_item(mtm, self);
             self.ivars().status_item.set(status_item).unwrap();
@@ -496,6 +512,16 @@ define_class!(
             self.select_sort(SortField::Relevance);
         }
 
+        #[unsafe(method(sortSelectionChanged:))]
+        fn sort_selection_changed_action(&self, sender: Option<&AnyObject>) {
+            let Some(popup) = sender.and_then(|sender| sender.downcast_ref::<NSPopUpButton>()) else {
+                return;
+            };
+            if let Some(field) = sort_field_for_popup_index(popup.indexOfSelectedItem()) {
+                self.choose_sort_field(field);
+            }
+        }
+
         #[unsafe(method(sortByCreationTime:))]
         fn sort_by_creation_time_action(&self, _sender: Option<&AnyObject>) {
             self.select_sort(SortField::CreationTime);
@@ -542,6 +568,7 @@ define_class!(
         fn toggle_hidden_results_action(&self, _sender: Option<&AnyObject>) {
             self.ivars().show_hidden.set(!self.ivars().show_hidden.get());
             self.ivars().requested_limit.set(100);
+            self.sync_search_controls();
             self.run_search();
         }
 
@@ -995,7 +1022,45 @@ impl Delegate {
         self.ivars().sort.set(sort);
         self.ivars().requested_limit.set(100);
         self.persist_sort_order(sort);
+        self.sync_search_controls();
         self.run_search();
+    }
+
+    fn choose_sort_field(&self, field: SortField) {
+        let current = self.ivars().sort.get();
+        let sort = SortOrder {
+            field,
+            direction: if current.field == field {
+                current.direction
+            } else {
+                SortDirection::Ascending
+            },
+        };
+        self.ivars().sort.set(sort);
+        self.ivars().requested_limit.set(100);
+        self.persist_sort_order(sort);
+        self.sync_search_controls();
+        self.run_search();
+    }
+
+    fn sync_search_controls(&self) {
+        let sort = self.ivars().sort.get();
+        if let Some(popup) = self.ivars().sort_popup.get() {
+            popup.selectItemAtIndex(sort_popup_index(sort.field));
+        }
+        if let Some(button) = self.ivars().direction_button.get() {
+            button.setTitle(match sort.direction {
+                SortDirection::Ascending => ns_string!("升序 ↕"),
+                SortDirection::Descending => ns_string!("降序 ↕"),
+            });
+        }
+        if let Some(button) = self.ivars().hidden_button.get() {
+            button.setTitle(if self.ivars().show_hidden.get() {
+                ns_string!("隐藏项目：显示  ⌘⇧.")
+            } else {
+                ns_string!("隐藏项目：隐藏  ⌘⇧.")
+            });
+        }
     }
 
     fn restore_sort_order(&self) {
@@ -1570,6 +1635,29 @@ fn current_time_ns() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn sort_popup_index(field: SortField) -> isize {
+    match field {
+        SortField::Relevance => 0,
+        SortField::ModificationTime => 1,
+        SortField::CreationTime => 2,
+        SortField::FileName => 3,
+        SortField::FullPath => 4,
+        SortField::FileSize => 5,
+    }
+}
+
+fn sort_field_for_popup_index(index: isize) -> Option<SortField> {
+    match index {
+        0 => Some(SortField::Relevance),
+        1 => Some(SortField::ModificationTime),
+        2 => Some(SortField::CreationTime),
+        3 => Some(SortField::FileName),
+        4 => Some(SortField::FullPath),
+        5 => Some(SortField::FileSize),
+        _ => None,
+    }
+}
+
 fn human_file_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -1714,19 +1802,26 @@ fn build_search_window(
         NSView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 476.0), NSSize::new(1060.0, 50.0)),
     );
-    let sort_button = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            ns_string!("相关性 ⌄"),
-            Some(delegate),
-            Some(sel!(sortByRelevance:)),
-            mtm,
-        )
-    };
-    sort_button.setFrame(NSRect::new(
-        NSPoint::new(12.0, 9.0),
-        NSSize::new(92.0, 32.0),
-    ));
-    toolbar.addSubview(&sort_button);
+    let sort_popup = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(12.0, 9.0), NSSize::new(92.0, 32.0)),
+        false,
+    );
+    for title in [
+        "相关性",
+        "修改时间",
+        "创建时间",
+        "文件名",
+        "完整路径",
+        "文件大小",
+    ] {
+        sort_popup.addItemWithTitle(&objc2_foundation::NSString::from_str(title));
+    }
+    unsafe {
+        sort_popup.setTarget(Some(delegate));
+        sort_popup.setAction(Some(sel!(sortSelectionChanged:)));
+    }
+    toolbar.addSubview(&sort_popup);
     let direction_button = unsafe {
         NSButton::buttonWithTitle_target_action(
             ns_string!("降序 ↕"),
@@ -1833,6 +1928,9 @@ fn build_search_window(
         table,
         state_title: status_title,
         state_detail: status_detail,
+        sort_popup,
+        direction_button,
+        hidden_button,
     }
 }
 
@@ -2173,7 +2271,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod ui_format_tests {
-    use super::{format_count, skipped_locations_summary};
+    use super::{
+        SortField, format_count, skipped_locations_summary, sort_field_for_popup_index,
+        sort_popup_index,
+    };
 
     #[test]
     fn index_progress_groups_scanned_entry_count() {
@@ -2194,5 +2295,23 @@ mod ui_format_tests {
         assert!(!summary.contains("location 101"));
         assert!(summary.ends_with("…另有 5 个位置未显示"));
         assert_eq!(skipped_locations_summary(&[], 100), None);
+    }
+
+    #[test]
+    fn sort_popup_round_trips_every_sort_field() {
+        for field in [
+            SortField::Relevance,
+            SortField::ModificationTime,
+            SortField::CreationTime,
+            SortField::FileName,
+            SortField::FullPath,
+            SortField::FileSize,
+        ] {
+            assert_eq!(
+                sort_field_for_popup_index(sort_popup_index(field)),
+                Some(field)
+            );
+        }
+        assert_eq!(sort_field_for_popup_index(-1), None);
     }
 }
