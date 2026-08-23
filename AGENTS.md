@@ -4,6 +4,8 @@
 
 **Never commit code changes directly to `master`.**
 
+On any non-master branch, commit freely (WIP, fixes, rewrites). Ordinary commits are fine and expected there.
+
 Every change follows the issue-driven loop:
 
 1. **Issue first.** Open a GitHub issue describing the question or task (body starts with a `## Question` for research/grilling tickets). Label it (`wayfinder:research` / `wayfinder:prototype` / `wayfinder:grilling` / `wayfinder:task`, or `ready-for-agent` when fully specified).
@@ -12,9 +14,9 @@ Every change follows the issue-driven loop:
 4. **Squash merge.** The merge title is an imperative one-liner describing the delivered capability, with the PR number appended (e.g. `Recover safely from damaged file indexes (#32)`).
 5. **Close the issue** after merge.
 
-Each squashed commit should be a complete, releasable unit (code + tests + docs). Feature tickets deliver a matching `docs/architecture/*.md`; qualification tickets deliver `docs/qualification/*.md`.
+Merging to `master` requires the issue → branch → PR → squash loop above. Exception: trivial fixes (typos, doc tweaks) may go straight to `master`. Opening an issue and a branch is cheap; when in doubt, use the loop.
 
-Exceptions: trivial fixes (typos, doc tweaks) may go straight to `master`.
+Each squashed commit should be a complete, releasable unit (code + tests + docs). Feature tickets deliver a matching `docs/architecture/*.md`; qualification tickets deliver `docs/qualification/*.md`.
 
 ## Agent skills
 

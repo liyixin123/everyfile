@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::index::{IndexStore, VolumeCheckpoint};
 use crate::model::{Coverage, RootCoverage};
 use crate::projection::SearchProjection;
-use crate::scanner::scan_root;
+use crate::scanner::scan_root_with_progress_excluding;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CoalescingPreset {
@@ -184,7 +184,8 @@ pub fn reconcile_committed_root(
     if batch.stream_identity.is_empty() {
         return Err("FSEvents stream identity is missing".into());
     }
-    let report = scan_root(root).map_err(|error| error.to_string())?;
+    let report = scan_root_with_progress_excluding(root, |_| {}, &[data_directory.to_path_buf()])
+        .map_err(|error| error.to_string())?;
     let mut store = IndexStore::open(&data_directory.join("index.sqlite3"))
         .map_err(|error| error.to_string())?;
     let generation = store
@@ -243,7 +244,10 @@ fn reconcile_committed_scopes(
         if !scope.exists() {
             continue;
         }
-        observed.push(scan_root(scope).map_err(|error| error.to_string())?);
+        observed.push(
+            scan_root_with_progress_excluding(scope, |_| {}, &[data_directory.to_path_buf()])
+                .map_err(|error| error.to_string())?,
+        );
     }
     let coverage = if prior.coverage == Coverage::Partial
         || observed

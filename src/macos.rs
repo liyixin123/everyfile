@@ -9,22 +9,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertThirdButtonReturn,
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSColor, NSControl, NSControlTextEditingDelegate, NSEventModifierFlags,
-    NSFloatingWindowLevel, NSFont, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
-    NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
-    NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength,
-    NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidMountNotification,
-    NSWorkspaceDidUnmountNotification, NSWorkspaceDidWakeNotification,
+    NSAppearance, NSAppearanceNameDarkAqua, NSApplication, NSApplicationActivationPolicy,
+    NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
+    NSControl, NSControlTextEditingDelegate, NSEventModifierFlags, NSFloatingWindowLevel, NSFont,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn,
+    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldDelegate,
+    NSTextView, NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask,
+    NSWorkspace, NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification,
+    NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSProcessInfo,
-    NSProcessInfoThermalState, NSRect, NSSize, NSTimer, NSURL, NSUserDefaults, ns_string,
+    MainThreadMarker, NSDate, NSDateFormatter, NSDateFormatterStyle, NSNotification, NSObject,
+    NSObjectProtocol, NSPoint, NSProcessInfo, NSProcessInfoThermalState, NSRect, NSSize, NSTimer,
+    NSURL, NSUserDefaults, ns_string,
 };
 
 use crate::actions::{ResultAction, ResultActionDispatcher};
@@ -110,12 +113,18 @@ struct AppDelegateIvars {
     table: OnceCell<Retained<NSTableView>>,
     state_title: OnceCell<Retained<NSTextField>>,
     state_detail: OnceCell<Retained<NSTextField>>,
+    date_formatter: OnceCell<Retained<NSDateFormatter>>,
+    sort_popup: OnceCell<Retained<NSPopUpButton>>,
+    direction_button: OnceCell<Retained<NSButton>>,
+    hidden_button: OnceCell<Retained<NSButton>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
     status_state_item: OnceCell<Retained<NSMenuItem>>,
     skipped_locations_item: OnceCell<Retained<NSMenuItem>>,
     scheduler: OnceCell<BackgroundScheduler>,
     runtime: Arc<Mutex<RuntimeIndex>>,
     results: RefCell<Vec<SearchResult>>,
+    state_title_cache: RefCell<Option<String>>,
+    state_detail_cache: RefCell<Option<String>>,
     hot_key: Cell<EventHotKeyRef>,
     launch: Instant,
     sort: Cell<SortOrder>,
@@ -163,6 +172,9 @@ struct SearchWindowParts {
     table: Retained<NSTableView>,
     state_title: Retained<NSTextField>,
     state_detail: Retained<NSTextField>,
+    sort_popup: Retained<NSPopUpButton>,
+    direction_button: Retained<NSButton>,
+    hidden_button: Retained<NSButton>,
 }
 
 impl Default for AppDelegateIvars {
@@ -173,6 +185,10 @@ impl Default for AppDelegateIvars {
             table: OnceCell::new(),
             state_title: OnceCell::new(),
             state_detail: OnceCell::new(),
+            date_formatter: OnceCell::new(),
+            sort_popup: OnceCell::new(),
+            direction_button: OnceCell::new(),
+            hidden_button: OnceCell::new(),
             status_item: OnceCell::new(),
             status_state_item: OnceCell::new(),
             skipped_locations_item: OnceCell::new(),
@@ -191,6 +207,8 @@ impl Default for AppDelegateIvars {
                 recovery_notice: None,
             })),
             results: RefCell::new(Vec::new()),
+            state_title_cache: RefCell::new(None),
+            state_detail_cache: RefCell::new(None),
             hot_key: Cell::new(ptr::null_mut()),
             launch: Instant::now(),
             sort: Cell::new(SortOrder::default()),
@@ -247,6 +265,13 @@ define_class!(
             self.ivars().table.set(parts.table).unwrap();
             self.ivars().state_title.set(parts.state_title).unwrap();
             self.ivars().state_detail.set(parts.state_detail).unwrap();
+            self.ivars().sort_popup.set(parts.sort_popup).unwrap();
+            self.ivars()
+                .direction_button
+                .set(parts.direction_button)
+                .unwrap();
+            self.ivars().hidden_button.set(parts.hidden_button).unwrap();
+            self.sync_search_controls();
             let (status_item, status_state_item, skipped_locations_item) =
                 build_status_item(mtm, self);
             self.ivars().status_item.set(status_item).unwrap();
@@ -396,21 +421,29 @@ define_class!(
             let value = match identifier.as_str() {
                 "name" => result.name.clone(),
                 "path" => result.path.to_string_lossy().into_owned(),
-                "modified" => result
-                    .modified_ns
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                "created" => result
-                    .created_ns
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                "size" => result.size.to_string(),
+                "modified" => format_file_time(
+                    &self.ivars().date_formatter,
+                    result.modified_ns,
+                ),
+                "created" => format_file_time(
+                    &self.ivars().date_formatter,
+                    result.created_ns,
+                ),
+                "size" => human_file_size(result.size),
                 _ => String::new(),
             };
             let label = NSTextField::labelWithString(
                 &objc2_foundation::NSString::from_str(&value),
                 self.mtm(),
             );
+            label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            let color = if identifier == "path" {
+                NSColor::secondaryLabelColor()
+            } else {
+                NSColor::labelColor()
+            };
+            label.setTextColor(Some(&color));
+            label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
             Some(label.into_super().into_super())
         }
     }
@@ -479,9 +512,24 @@ define_class!(
             self.select_sort(SortField::Relevance);
         }
 
+        #[unsafe(method(sortSelectionChanged:))]
+        fn sort_selection_changed_action(&self, sender: Option<&AnyObject>) {
+            let Some(popup) = sender.and_then(|sender| sender.downcast_ref::<NSPopUpButton>()) else {
+                return;
+            };
+            if let Some(field) = sort_field_for_popup_index(popup.indexOfSelectedItem()) {
+                self.choose_sort_field(field);
+            }
+        }
+
         #[unsafe(method(sortByCreationTime:))]
         fn sort_by_creation_time_action(&self, _sender: Option<&AnyObject>) {
             self.select_sort(SortField::CreationTime);
+        }
+
+        #[unsafe(method(toggleSortDirection:))]
+        fn toggle_sort_direction_action(&self, _sender: Option<&AnyObject>) {
+            self.select_sort(self.ivars().sort.get().field);
         }
 
         #[unsafe(method(useResponsiveIndexing:))]
@@ -520,6 +568,7 @@ define_class!(
         fn toggle_hidden_results_action(&self, _sender: Option<&AnyObject>) {
             self.ivars().show_hidden.set(!self.ivars().show_hidden.get());
             self.ivars().requested_limit.set(100);
+            self.sync_search_controls();
             self.run_search();
         }
 
@@ -564,8 +613,12 @@ impl Delegate {
         let runtime = Arc::clone(&self.ivars().runtime);
         let user_paused = Arc::clone(&self.ivars().user_paused);
         let resource_root = root.clone();
-        runtime.lock().unwrap().state = FileIndexState::Rebuilding { scanned_entries: 0 };
         let data_directory = default_data_directory();
+        let has_existing_index = data_directory.join("index.sqlite3").exists()
+            && data_directory.join("search.projection").exists();
+        if !has_existing_index {
+            runtime.lock().unwrap().state = FileIndexState::Rebuilding { scanned_entries: 0 };
+        }
         let schedule_result = self
             .ivars()
             .scheduler
@@ -654,12 +707,18 @@ impl Delegate {
         }
         let paused = self.ivars().user_paused.load(Ordering::Acquire);
         let title = if paused {
-            "File Index: Paused"
+            "索引已暂停".to_owned()
         } else {
             match runtime.freshness {
-                Freshness::CatchingUp => "File Index: Catching Up",
-                Freshness::Offline => "File Index: Offline",
-                _ => runtime.state.title(),
+                Freshness::CatchingUp => "正在补齐索引 · 结果可用".to_owned(),
+                Freshness::Offline => "索引离线".to_owned(),
+                Freshness::Current => "●  索引已更新".to_owned(),
+                Freshness::Rebuilding => match runtime.state {
+                    FileIndexState::Rebuilding { scanned_entries } => {
+                        format!("正在建立索引 · 已扫描 {} 项", format_count(scanned_entries))
+                    }
+                    _ => "正在加载索引".to_owned(),
+                },
             }
         };
         let coverage = overall_coverage(&runtime.coverage_reports);
@@ -684,11 +743,18 @@ impl Delegate {
                 runtime.state.detail()
             }
         });
-        if let Some(label) = self.ivars().state_title.get() {
-            label.setStringValue(&objc2_foundation::NSString::from_str(title));
+        if self.ivars().state_title_cache.borrow().as_deref() != Some(title.as_str()) {
+            if let Some(label) = self.ivars().state_title.get() {
+                label.setStringValue(&objc2_foundation::NSString::from_str(&title));
+            }
+            *self.ivars().state_title_cache.borrow_mut() = Some(title.clone());
         }
-        if let Some(label) = self.ivars().state_detail.get() {
-            label.setStringValue(&objc2_foundation::NSString::from_str(&detail));
+        let result_count = format!("{} 个结果", self.ivars().exact_total.get());
+        if self.ivars().state_detail_cache.borrow().as_deref() != Some(result_count.as_str()) {
+            if let Some(label) = self.ivars().state_detail.get() {
+                label.setStringValue(&objc2_foundation::NSString::from_str(&result_count));
+            }
+            *self.ivars().state_detail_cache.borrow_mut() = Some(result_count);
         }
         if let Some(item) = self.ivars().status_state_item.get() {
             let coverage_title = match coverage {
@@ -809,8 +875,18 @@ impl Delegate {
             .as_ref()
             .map(|receiver| receiver.try_iter().collect())
             .unwrap_or_default();
-        for batch in batches {
-            self.ivars().event_hints.borrow_mut().push(batch);
+        let data_directory = default_data_directory();
+        for mut batch in batches {
+            batch
+                .paths
+                .retain(|path| !path.starts_with(&data_directory));
+            if !batch.paths.is_empty()
+                || batch.history_lost
+                || batch.ids_wrapped
+                || batch.root_changed
+            {
+                self.ivars().event_hints.borrow_mut().push(batch);
+            }
         }
         if !self.ivars().event_hints.borrow().has_pending() {
             return;
@@ -960,7 +1036,45 @@ impl Delegate {
         self.ivars().sort.set(sort);
         self.ivars().requested_limit.set(100);
         self.persist_sort_order(sort);
+        self.sync_search_controls();
         self.run_search();
+    }
+
+    fn choose_sort_field(&self, field: SortField) {
+        let current = self.ivars().sort.get();
+        let sort = SortOrder {
+            field,
+            direction: if current.field == field {
+                current.direction
+            } else {
+                SortDirection::Ascending
+            },
+        };
+        self.ivars().sort.set(sort);
+        self.ivars().requested_limit.set(100);
+        self.persist_sort_order(sort);
+        self.sync_search_controls();
+        self.run_search();
+    }
+
+    fn sync_search_controls(&self) {
+        let sort = self.ivars().sort.get();
+        if let Some(popup) = self.ivars().sort_popup.get() {
+            popup.selectItemAtIndex(sort_popup_index(sort.field));
+        }
+        if let Some(button) = self.ivars().direction_button.get() {
+            button.setTitle(match sort.direction {
+                SortDirection::Ascending => ns_string!("升序 ↕"),
+                SortDirection::Descending => ns_string!("降序 ↕"),
+            });
+        }
+        if let Some(button) = self.ivars().hidden_button.get() {
+            button.setTitle(if self.ivars().show_hidden.get() {
+                ns_string!("隐藏项目：显示  ⌘⇧.")
+            } else {
+                ns_string!("隐藏项目：隐藏  ⌘⇧.")
+            });
+        }
     }
 
     fn restore_sort_order(&self) {
@@ -1105,12 +1219,15 @@ impl Delegate {
                 ));
             }
         }
-        if lines.is_empty() {
+        let Some(summary) = skipped_locations_summary(&lines, 100) else {
             return;
-        }
+        };
         let alert = NSAlert::new(self.mtm());
         alert.setMessageText(ns_string!("Skipped Locations"));
-        alert.setInformativeText(&objc2_foundation::NSString::from_str(&lines.join("\n\n")));
+        alert.setInformativeText(&objc2_foundation::NSString::from_str(&summary));
+        // NSAlert does not synthesize a dismiss button. Without one, runModal
+        // has no reliable response that ends its nested event loop.
+        alert.addButtonWithTitle(ns_string!("关闭"));
         alert.runModal();
     }
 
@@ -1532,12 +1649,103 @@ fn current_time_ns() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn sort_popup_index(field: SortField) -> isize {
+    match field {
+        SortField::Relevance => 0,
+        SortField::ModificationTime => 1,
+        SortField::CreationTime => 2,
+        SortField::FileName => 3,
+        SortField::FullPath => 4,
+        SortField::FileSize => 5,
+    }
+}
+
+fn sort_field_for_popup_index(index: isize) -> Option<SortField> {
+    match index {
+        0 => Some(SortField::Relevance),
+        1 => Some(SortField::ModificationTime),
+        2 => Some(SortField::CreationTime),
+        3 => Some(SortField::FileName),
+        4 => Some(SortField::FullPath),
+        5 => Some(SortField::FileSize),
+        _ => None,
+    }
+}
+
+fn human_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    match bytes {
+        0 => "—".into(),
+        1..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{:.0} KB", bytes as f64 / KB),
+        1_048_576..=1_073_741_823 => format!("{:.1} MB", bytes as f64 / MB),
+        _ => format!("{:.1} GB", bytes as f64 / GB),
+    }
+}
+
+fn format_file_time(
+    formatter: &OnceCell<Retained<NSDateFormatter>>,
+    nanoseconds_since_epoch: Option<i64>,
+) -> String {
+    let Some(nanoseconds) = nanoseconds_since_epoch else {
+        return "—".into();
+    };
+    let formatter = formatter.get_or_init(|| {
+        let formatter = NSDateFormatter::new();
+        formatter.setDateStyle(NSDateFormatterStyle::MediumStyle);
+        formatter.setTimeStyle(NSDateFormatterStyle::ShortStyle);
+        formatter.setDoesRelativeDateFormatting(true);
+        formatter
+    });
+    let date = NSDate::dateWithTimeIntervalSince1970(nanoseconds as f64 / 1_000_000_000.0);
+    formatter.stringFromDate(&date).to_string()
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    formatted
+}
+
+fn skipped_locations_summary(lines: &[String], limit: usize) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    let shown = lines.len().min(limit.max(1));
+    let mut summary = lines[..shown].join("\n\n");
+    let remaining = lines.len() - shown;
+    if remaining > 0 {
+        summary.push_str(&format!(
+            "\n\n…另有 {} 个位置未显示",
+            format_count(remaining as u64)
+        ));
+    }
+    Some(summary)
+}
+
 fn build_search_window(
     mtm: MainThreadMarker,
     snapshot: &AppSnapshot,
     delegate: &Delegate,
 ) -> SearchWindowParts {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(760.0, 460.0));
+    // The reference is explicitly dark regardless of the system appearance.
+    // Fixing the app appearance also keeps native controls and table selection
+    // colors consistent with the HTML prototype.
+    let dark_appearance = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua });
+    NSApplication::sharedApplication(mtm).setAppearance(dark_appearance.as_deref());
+
+    // Variant A is deliberately a wide, dense utility window. Keep these
+    // dimensions in points: the prototype's 1060 CSS pixels map 1:1 to AppKit
+    // points (and therefore to 2120 pixels on a Retina display).
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1060.0, 610.0));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -1556,85 +1764,228 @@ fn build_search_window(
     window.setLevel(NSFloatingWindowLevel);
     window.setOpaque(false);
     window.setBackgroundColor(Some(&NSColor::clearColor()));
+    window.setMinSize(NSSize::new(820.0, 460.0));
     window.center();
 
-    let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
-    effect.setMaterial(NSVisualEffectMaterial::UnderWindowBackground);
-    effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
-    effect.setState(NSVisualEffectState::FollowsWindowActiveState);
-    effect.setAutoresizingMask(
+    let content = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    content.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
 
+    let search_frame = NSRect::new(NSPoint::new(0.0, 526.0), NSSize::new(1060.0, 62.0));
+    let search_content = NSView::initWithFrame(NSView::alloc(mtm), search_frame);
+
+    let search_icon = NSTextField::labelWithString(ns_string!("⌕"), mtm);
+    search_icon.setFrame(NSRect::new(
+        NSPoint::new(20.0, 19.0),
+        NSSize::new(24.0, 25.0),
+    ));
+    search_icon.setFont(Some(&NSFont::systemFontOfSize(20.0)));
+    search_icon.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    search_content.addSubview(&search_icon);
+
     let search = NSTextField::textFieldWithString(ns_string!(""), mtm);
     search.setFrame(NSRect::new(
-        NSPoint::new(24.0, 380.0),
-        NSSize::new(712.0, 42.0),
+        NSPoint::new(44.0, 10.0),
+        NSSize::new(900.0, 42.0),
     ));
     search.setPlaceholderString(Some(ns_string!("Search file names and paths")));
     search.setFont(Some(&NSFont::systemFontOfSize(22.0)));
-    search.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    search.setTextColor(Some(&NSColor::labelColor()));
+    search.setBezeled(false);
+    search.setBordered(false);
+    search.setDrawsBackground(false);
+    search.setFocusRingType(objc2_app_kit::NSFocusRingType::None);
+    search.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
     unsafe { search.setDelegate(Some(ProtocolObject::from_ref(delegate))) };
+    search_content.addSubview(&search);
 
-    let table_frame = NSRect::new(NSPoint::new(24.0, 24.0), NSSize::new(712.0, 330.0));
-    let table = NSTableView::initWithFrame(NSTableView::alloc(mtm), table_frame);
-    table.setRowHeight(24.0);
+    let shortcut = NSTextField::labelWithString(ns_string!("⌥ Space"), mtm);
+    shortcut.setFrame(NSRect::new(
+        NSPoint::new(970.0, 21.0),
+        NSSize::new(72.0, 21.0),
+    ));
+    shortcut.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    shortcut.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    shortcut.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    search_content.addSubview(&shortcut);
+
+    let toolbar = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 476.0), NSSize::new(1060.0, 50.0)),
+    );
+    let sort_popup = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(12.0, 9.0), NSSize::new(92.0, 32.0)),
+        false,
+    );
+    for title in [
+        "相关性",
+        "修改时间",
+        "创建时间",
+        "文件名",
+        "完整路径",
+        "文件大小",
+    ] {
+        sort_popup.addItemWithTitle(&objc2_foundation::NSString::from_str(title));
+    }
+    unsafe {
+        sort_popup.setTarget(Some(delegate));
+        sort_popup.setAction(Some(sel!(sortSelectionChanged:)));
+    }
+    toolbar.addSubview(&sort_popup);
+    let direction_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("降序 ↕"),
+            Some(delegate),
+            Some(sel!(toggleSortDirection:)),
+            mtm,
+        )
+    };
+    direction_button.setFrame(NSRect::new(
+        NSPoint::new(112.0, 9.0),
+        NSSize::new(78.0, 32.0),
+    ));
+    toolbar.addSubview(&direction_button);
+    let hidden_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("隐藏项目：显示  ⌘⇧."),
+            Some(delegate),
+            Some(sel!(toggleHiddenResults:)),
+            mtm,
+        )
+    };
+    hidden_button.setFrame(NSRect::new(
+        NSPoint::new(198.0, 9.0),
+        NSSize::new(170.0, 32.0),
+    ));
+    toolbar.addSubview(&hidden_button);
+
+    let table_frame = NSRect::new(NSPoint::new(0.0, 34.0), NSSize::new(1060.0, 442.0));
+    let table_content = NSView::initWithFrame(NSView::alloc(mtm), table_frame);
+    let table = NSTableView::initWithFrame(
+        NSTableView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
+    );
+    table.setRowHeight(31.0);
     table.setUsesAlternatingRowBackgroundColors(false);
     table.setBackgroundColor(&NSColor::clearColor());
-    add_table_column(mtm, &table, "name", "Name", 150.0);
-    add_table_column(mtm, &table, "path", "Path", 260.0);
-    add_table_column(mtm, &table, "modified", "Modified", 100.0);
-    add_table_column(mtm, &table, "created", "Created", 100.0);
-    add_table_column(mtm, &table, "size", "Size", 70.0);
+    table.setGridStyleMask(objc2_app_kit::NSTableViewGridLineStyle::empty());
+    table.setIntercellSpacing(NSSize::new(0.0, 0.0));
+    add_table_column(mtm, &table, "name", "名称", 270.0);
+    add_table_column(mtm, &table, "path", "路径", 570.0);
+    add_table_column(mtm, &table, "modified", "修改时间", 130.0);
+    add_table_column(mtm, &table, "size", "大小", 90.0);
     unsafe {
         table.setDataSource(Some(ProtocolObject::from_ref(delegate)));
         table.setDelegate(Some(ProtocolObject::from_ref(delegate)));
     }
 
-    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), table_frame);
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), table_frame.size),
+    );
     scroll.setDrawsBackground(false);
+    scroll.setBackgroundColor(&NSColor::clearColor());
     scroll.setHasVerticalScroller(false);
     scroll.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     scroll.setDocumentView(Some(&table));
-
-    let empty_title = NSTextField::labelWithString(
+    table_content.addSubview(&scroll);
+    let status_title = NSTextField::labelWithString(
         objc2_foundation::NSString::from_str(snapshot.file_index.title()).as_ref(),
         mtm,
     );
-    empty_title.setFrame(NSRect::new(
-        NSPoint::new(24.0, 210.0),
-        NSSize::new(712.0, 32.0),
+    status_title.setFrame(NSRect::new(
+        NSPoint::new(830.0, 9.0),
+        NSSize::new(210.0, 17.0),
     ));
-    empty_title.setFont(Some(&NSFont::systemFontOfSize(20.0)));
-    empty_title.setAlignment(objc2_app_kit::NSTextAlignment::Center);
-    empty_title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    status_title.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    status_title.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    status_title.setAlignment(objc2_app_kit::NSTextAlignment::Right);
+    status_title.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
 
-    let empty_detail = NSTextField::labelWithString(
+    let status_detail = NSTextField::labelWithString(
         objc2_foundation::NSString::from_str(&snapshot.file_index.detail()).as_ref(),
         mtm,
     );
-    empty_detail.setFrame(NSRect::new(
-        NSPoint::new(24.0, 180.0),
-        NSSize::new(712.0, 24.0),
+    status_detail.setFrame(NSRect::new(
+        NSPoint::new(12.0, 9.0),
+        NSSize::new(300.0, 17.0),
     ));
-    empty_detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    empty_detail.setAlignment(objc2_app_kit::NSTextAlignment::Center);
-    empty_detail.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+    status_detail.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    status_detail.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+    status_detail.setAlignment(objc2_app_kit::NSTextAlignment::Left);
+    status_detail.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
 
-    effect.addSubview(&search);
-    effect.addSubview(&scroll);
-    effect.addSubview(&empty_title);
-    effect.addSubview(&empty_detail);
-    window.setContentView(Some(&effect));
+    content.addSubview(&search_content);
+    content.addSubview(&toolbar);
+    content.addSubview(&table_content);
+    content.addSubview(&status_title);
+    content.addSubview(&status_detail);
+    let outer_surface =
+        build_glass_surface(mtm, frame, NSGlassEffectViewStyle::Regular, 12.0, &content);
+    outer_surface.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    window.setContentView(Some(&outer_surface));
     SearchWindowParts {
         window,
         search_field: search,
         table,
-        state_title: empty_title,
-        state_detail: empty_detail,
+        state_title: status_title,
+        state_detail: status_detail,
+        sort_popup,
+        direction_button,
+        hidden_button,
     }
+}
+
+fn build_glass_surface(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    style: NSGlassEffectViewStyle,
+    corner_radius: f64,
+    content_view: &NSView,
+) -> Retained<NSView> {
+    // NSGlassEffectView is macOS 26's native Liquid Glass surface. Resolve the
+    // class dynamically so the existing macOS 15 deployment target keeps its
+    // visual-effect fallback instead of taking a hard class-link dependency.
+    if let Some(class) = AnyClass::get(c"NSGlassEffectView") {
+        let glass: Retained<NSGlassEffectView> = unsafe {
+            let allocated: objc2::rc::Allocated<NSGlassEffectView> = msg_send![class, alloc];
+            NSGlassEffectView::initWithFrame(allocated, frame)
+        };
+        glass.setStyle(style);
+        glass.setCornerRadius(corner_radius);
+        let tint = if style == NSGlassEffectViewStyle::Clear {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.28, 0.46, 0.18)
+        } else {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.18, 0.32, 0.28)
+        };
+        glass.setTintColor(Some(&tint));
+        glass.setContentView(Some(content_view));
+        return glass.into_super();
+    }
+
+    let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
+    effect.setMaterial(if style == NSGlassEffectViewStyle::Clear {
+        NSVisualEffectMaterial::Popover
+    } else {
+        NSVisualEffectMaterial::HUDWindow
+    });
+    effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    effect.setState(NSVisualEffectState::FollowsWindowActiveState);
+    effect.setAlphaValue(0.96);
+    effect.addSubview(content_view);
+    effect.into_super()
 }
 
 fn add_table_column(
@@ -1646,9 +1997,14 @@ fn add_table_column(
 ) {
     let identifier = objc2_foundation::NSString::from_str(identifier);
     let column = NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), &identifier);
-    column
-        .headerCell()
-        .setStringValue(&objc2_foundation::NSString::from_str(title));
+    let header = column.headerCell();
+    header.setStringValue(&objc2_foundation::NSString::from_str(title));
+    header.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    header.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    header.setBackgroundColor(Some(&NSColor::clearColor()));
+    header.setDrawsBackground(false);
+    header.setBezeled(false);
+    header.setBordered(false);
     column.setWidth(width);
     column.setMinWidth(60.0);
     table.addTableColumn(&column);
@@ -1925,4 +2281,51 @@ pub fn run() {
     let delegate = Delegate::new(mtm);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     app.run();
+}
+
+#[cfg(test)]
+mod ui_format_tests {
+    use super::{
+        SortField, format_count, skipped_locations_summary, sort_field_for_popup_index,
+        sort_popup_index,
+    };
+
+    #[test]
+    fn index_progress_groups_scanned_entry_count() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(12_345), "12,345");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn skipped_locations_summary_is_bounded_and_reports_remainder() {
+        let lines = (1..=105)
+            .map(|value| format!("location {value}"))
+            .collect::<Vec<_>>();
+        let summary = skipped_locations_summary(&lines, 100).unwrap();
+
+        assert!(summary.contains("location 100"));
+        assert!(!summary.contains("location 101"));
+        assert!(summary.ends_with("…另有 5 个位置未显示"));
+        assert_eq!(skipped_locations_summary(&[], 100), None);
+    }
+
+    #[test]
+    fn sort_popup_round_trips_every_sort_field() {
+        for field in [
+            SortField::Relevance,
+            SortField::ModificationTime,
+            SortField::CreationTime,
+            SortField::FileName,
+            SortField::FullPath,
+            SortField::FileSize,
+        ] {
+            assert_eq!(
+                sort_field_for_popup_index(sort_popup_index(field)),
+                Some(field)
+            );
+        }
+        assert_eq!(sort_field_for_popup_index(-1), None);
+    }
 }

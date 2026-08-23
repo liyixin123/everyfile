@@ -14,13 +14,13 @@ SQLite is the only durable File Index. On restart, a matching committed root is 
 
 ## Truthful state
 
-Before a configured root exists, state remains `No File Index`. During enumeration it is `File Index: Rebuilding` with the observed entry count. Only a committed generation with a validated projection becomes `File Index: Current`. Coverage is Complete only when enumeration recorded no skipped/error location; otherwise it is Partial.
+The application uses the current user's home directory as its default root. If neither a configured root nor a user home can be resolved, state remains `No File Index`. During enumeration it is `File Index: Rebuilding` with the observed entry count. Only a committed generation with a validated projection becomes `File Index: Current`. Coverage is Complete only when enumeration recorded no skipped/error location; otherwise it is Partial.
 
 The same state appears in the Quick Search Window and Menu Bar Control. Typing never starts a scan. In this slice, Return submits the Search Query; query-as-you-type and cancellation belong to the later query tickets.
 
 ## Controlled-root acceptance seam
 
-Set `EVERYFILE_INDEX_ROOT` to a permitted directory on an internal volume and optionally set `EVERYFILE_DATA_DIR` to an isolated data directory before launching the executable. These variables are a development and integration seam, not an end-user volume-selection surface.
+By default the application indexes the current user's `HOME`. Set `EVERYFILE_INDEX_ROOT` to override that root with a permitted directory on an internal volume, and optionally set `EVERYFILE_DATA_DIR` to isolate the index data directory. These variables are a development and integration seam, not an end-user volume-selection surface.
 
 The highest-level repeatable test creates real files beneath the controlled root and verifies Scanner → SQLite → projection → Search Query behavior. Lower tests cover mount selection, symlink non-traversal, transaction rollback, projection validation/rebuild, and process-independent SQLite reopen.
 
