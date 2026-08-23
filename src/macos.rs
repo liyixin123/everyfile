@@ -1140,12 +1140,15 @@ impl Delegate {
                 ));
             }
         }
-        if lines.is_empty() {
+        let Some(summary) = skipped_locations_summary(&lines, 100) else {
             return;
-        }
+        };
         let alert = NSAlert::new(self.mtm());
         alert.setMessageText(ns_string!("Skipped Locations"));
-        alert.setInformativeText(&objc2_foundation::NSString::from_str(&lines.join("\n\n")));
+        alert.setInformativeText(&objc2_foundation::NSString::from_str(&summary));
+        // NSAlert does not synthesize a dismiss button. Without one, runModal
+        // has no reliable response that ends its nested event loop.
+        alert.addButtonWithTitle(ns_string!("关闭"));
         alert.runModal();
     }
 
@@ -1608,6 +1611,22 @@ fn format_count(value: u64) -> String {
         formatted.push(character);
     }
     formatted
+}
+
+fn skipped_locations_summary(lines: &[String], limit: usize) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    let shown = lines.len().min(limit.max(1));
+    let mut summary = lines[..shown].join("\n\n");
+    let remaining = lines.len() - shown;
+    if remaining > 0 {
+        summary.push_str(&format!(
+            "\n\n…另有 {} 个位置未显示",
+            format_count(remaining as u64)
+        ));
+    }
+    Some(summary)
 }
 
 fn build_search_window(
@@ -2154,7 +2173,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod ui_format_tests {
-    use super::format_count;
+    use super::{format_count, skipped_locations_summary};
 
     #[test]
     fn index_progress_groups_scanned_entry_count() {
@@ -2162,5 +2181,18 @@ mod ui_format_tests {
         assert_eq!(format_count(999), "999");
         assert_eq!(format_count(12_345), "12,345");
         assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn skipped_locations_summary_is_bounded_and_reports_remainder() {
+        let lines = (1..=105)
+            .map(|value| format!("location {value}"))
+            .collect::<Vec<_>>();
+        let summary = skipped_locations_summary(&lines, 100).unwrap();
+
+        assert!(summary.contains("location 100"));
+        assert!(!summary.contains("location 101"));
+        assert!(summary.ends_with("…另有 5 个位置未显示"));
+        assert_eq!(skipped_locations_summary(&[], 100), None);
     }
 }
