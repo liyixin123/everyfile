@@ -107,7 +107,17 @@ pub fn default_data_directory() -> PathBuf {
 }
 
 pub fn configured_root() -> Option<PathBuf> {
-    std::env::var_os("EVERYFILE_INDEX_ROOT").map(PathBuf::from)
+    configured_root_from(
+        std::env::var_os("EVERYFILE_INDEX_ROOT"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn configured_root_from(
+    configured: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    configured.or(home).map(PathBuf::from)
 }
 
 pub fn coverage_for_skips(skip_count: usize) -> Coverage {
@@ -125,6 +135,19 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn configured_root_prefers_override_and_falls_back_to_user_home() {
+        assert_eq!(
+            configured_root_from(Some("/tmp/fixture".into()), Some("/Users/tester".into())),
+            Some(PathBuf::from("/tmp/fixture"))
+        );
+        assert_eq!(
+            configured_root_from(None, Some("/Users/tester".into())),
+            Some(PathBuf::from("/Users/tester"))
+        );
+        assert_eq!(configured_root_from(None, None), None);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
