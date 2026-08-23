@@ -117,6 +117,8 @@ struct AppDelegateIvars {
     scheduler: OnceCell<BackgroundScheduler>,
     runtime: Arc<Mutex<RuntimeIndex>>,
     results: RefCell<Vec<SearchResult>>,
+    state_title_cache: RefCell<Option<String>>,
+    state_detail_cache: RefCell<Option<String>>,
     hot_key: Cell<EventHotKeyRef>,
     launch: Instant,
     sort: Cell<SortOrder>,
@@ -192,6 +194,8 @@ impl Default for AppDelegateIvars {
                 recovery_notice: None,
             })),
             results: RefCell::new(Vec::new()),
+            state_title_cache: RefCell::new(None),
+            state_detail_cache: RefCell::new(None),
             hot_key: Cell::new(ptr::null_mut()),
             launch: Instant::now(),
             sort: Cell::new(SortOrder::default()),
@@ -688,11 +692,17 @@ impl Delegate {
                 runtime.state.detail()
             }
         });
-        if let Some(label) = self.ivars().state_title.get() {
-            label.setStringValue(&objc2_foundation::NSString::from_str(title));
+        if self.ivars().state_title_cache.borrow().as_deref() != Some(title) {
+            if let Some(label) = self.ivars().state_title.get() {
+                label.setStringValue(&objc2_foundation::NSString::from_str(title));
+            }
+            *self.ivars().state_title_cache.borrow_mut() = Some(title.to_owned());
         }
-        if let Some(label) = self.ivars().state_detail.get() {
-            label.setStringValue(&objc2_foundation::NSString::from_str(&detail));
+        if self.ivars().state_detail_cache.borrow().as_deref() != Some(detail.as_str()) {
+            if let Some(label) = self.ivars().state_detail.get() {
+                label.setStringValue(&objc2_foundation::NSString::from_str(&detail));
+            }
+            *self.ivars().state_detail_cache.borrow_mut() = Some(detail.clone());
         }
         if let Some(item) = self.ivars().status_state_item.get() {
             let coverage_title = match coverage {
