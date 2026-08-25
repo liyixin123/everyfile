@@ -1798,7 +1798,8 @@ impl ResultActionDispatcher for MacResultActionDispatcher {
                 let Some(url_string) = url.absoluteString() else {
                     return false;
                 };
-                unsafe { pasteboard.setPropertyList_forType(&url_string, NSPasteboardTypeFileURL) }
+                let urls = objc2_foundation::NSArray::from_retained_slice(&[url_string]);
+                unsafe { pasteboard.setPropertyList_forType(&urls, NSPasteboardTypeFileURL) }
             }
         }
     }
