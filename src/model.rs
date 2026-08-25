@@ -46,12 +46,29 @@ pub enum Freshness {
     Offline,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EntryKind {
     File,
     Directory,
     Symlink,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryFilter {
+    All,
+    Files,
+    Folders,
+}
+
+impl EntryFilter {
+    pub const fn includes(self, kind: EntryKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Files => !matches!(kind, EntryKind::Directory),
+            Self::Folders => matches!(kind, EntryKind::Directory),
+        }
+    }
 }
 
 impl EntryKind {
@@ -113,6 +130,7 @@ pub struct SearchResult {
     pub size: u64,
     pub created_ns: Option<i64>,
     pub modified_ns: Option<i64>,
+    pub kind: EntryKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,5 +174,15 @@ mod tests {
             overall_coverage(&[report(Coverage::Complete), report(Coverage::Partial)]),
             Some(Coverage::Partial)
         );
+    }
+
+    #[test]
+    fn result_filters_group_indexed_entry_types() {
+        assert!(EntryFilter::All.includes(EntryKind::Directory));
+        assert!(EntryFilter::Files.includes(EntryKind::Symlink));
+        assert!(EntryFilter::Files.includes(EntryKind::Other));
+        assert!(!EntryFilter::Files.includes(EntryKind::Directory));
+        assert!(EntryFilter::Folders.includes(EntryKind::Directory));
+        assert!(!EntryFilter::Folders.includes(EntryKind::File));
     }
 }

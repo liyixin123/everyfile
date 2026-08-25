@@ -16,13 +16,13 @@ use objc2_app_kit::{
     NSAppearance, NSAppearanceNameDarkAqua, NSApplication, NSApplicationActivationPolicy,
     NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
     NSControl, NSControlTextEditingDelegate, NSEventModifierFlags, NSFloatingWindowLevel, NSFont,
-    NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem, NSPasteboard,
-    NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSStatusBar, NSStatusItem, NSTableColumn,
-    NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldDelegate,
-    NSTextView, NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowStyleMask,
-    NSWorkspace, NSWorkspaceDidMountNotification, NSWorkspaceDidUnmountNotification,
-    NSWorkspaceDidWakeNotification,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem, NSOpenPanel, NSPasteboard,
+    NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSStatusBar,
+    NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidMountNotification,
+    NSWorkspaceDidUnmountNotification, NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDateFormatter, NSDateFormatterStyle, NSNotification, NSObject,
@@ -37,7 +37,8 @@ use crate::coordinator::{
 use crate::index::IndexStore;
 use crate::indexing_control::{ResourceConditions, WorkAllowance, work_allowance};
 use crate::model::{
-    AppSnapshot, Coverage, FileIndexState, Freshness, RootCoverage, SearchResult, overall_coverage,
+    AppSnapshot, Coverage, EntryFilter, EntryKind, FileIndexState, Freshness, RootCoverage,
+    SearchResult, overall_coverage,
 };
 use crate::projection::SearchProjection;
 use crate::query::{CancellationToken, SortDirection, SortField, SortOrder};
@@ -117,6 +118,8 @@ struct AppDelegateIvars {
     sort_popup: OnceCell<Retained<NSPopUpButton>>,
     direction_button: OnceCell<Retained<NSButton>>,
     hidden_button: OnceCell<Retained<NSButton>>,
+    filter_popup: OnceCell<Retained<NSPopUpButton>>,
+    result_menu: OnceCell<Retained<NSMenu>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
     status_state_item: OnceCell<Retained<NSMenuItem>>,
     skipped_locations_item: OnceCell<Retained<NSMenuItem>>,
@@ -141,6 +144,7 @@ struct AppDelegateIvars {
     external_state_initialized: Cell<bool>,
     coalescing_preset: Cell<CoalescingPreset>,
     show_hidden: Cell<bool>,
+    entry_filter: Cell<EntryFilter>,
     user_paused: Arc<AtomicBool>,
     accelerate_pending: Cell<bool>,
     next_reduced_work: Cell<Instant>,
@@ -175,6 +179,8 @@ struct SearchWindowParts {
     sort_popup: Retained<NSPopUpButton>,
     direction_button: Retained<NSButton>,
     hidden_button: Retained<NSButton>,
+    filter_popup: Retained<NSPopUpButton>,
+    result_menu: Retained<NSMenu>,
 }
 
 impl Default for AppDelegateIvars {
@@ -189,6 +195,8 @@ impl Default for AppDelegateIvars {
             sort_popup: OnceCell::new(),
             direction_button: OnceCell::new(),
             hidden_button: OnceCell::new(),
+            filter_popup: OnceCell::new(),
+            result_menu: OnceCell::new(),
             status_item: OnceCell::new(),
             status_state_item: OnceCell::new(),
             skipped_locations_item: OnceCell::new(),
@@ -224,6 +232,7 @@ impl Default for AppDelegateIvars {
             external_state_initialized: Cell::new(false),
             coalescing_preset: Cell::new(CoalescingPreset::Balanced),
             show_hidden: Cell::new(true),
+            entry_filter: Cell::new(EntryFilter::All),
             user_paused: Arc::new(AtomicBool::new(false)),
             accelerate_pending: Cell::new(false),
             next_reduced_work: Cell::new(Instant::now()),
@@ -253,6 +262,7 @@ define_class!(
             self.restore_sort_order();
             self.restore_coalescing_preset();
             self.restore_hidden_default();
+            self.restore_entry_filter();
             self.ivars()
                 .scheduler
                 .set(BackgroundScheduler::new(2, 64))
@@ -271,6 +281,8 @@ define_class!(
                 .set(parts.direction_button)
                 .unwrap();
             self.ivars().hidden_button.set(parts.hidden_button).unwrap();
+            self.ivars().filter_popup.set(parts.filter_popup).unwrap();
+            self.ivars().result_menu.set(parts.result_menu).unwrap();
             self.sync_search_controls();
             let (status_item, status_state_item, skipped_locations_item) =
                 build_status_item(mtm, self);
@@ -372,8 +384,6 @@ define_class!(
                     ResultAction::Open
                 };
                 self.dispatch_selected(action)
-            } else if command_selector == sel!(copy:) {
-                self.dispatch_selected(ResultAction::CopyPath)
             } else {
                 false
             }
@@ -383,6 +393,26 @@ define_class!(
     unsafe impl NSTextFieldDelegate for Delegate {}
 
     unsafe impl NSTableViewDelegate for Delegate {
+        #[unsafe(method(tableView:shouldSelectRow:))]
+        fn should_select_row(&self, _table: &NSTableView, _row: isize) -> bool { true }
+
+        #[unsafe(method(tableView:menuForTableColumn:row:))]
+        fn menu_for_table_row(
+            &self,
+            table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: isize,
+        ) -> Option<&NSMenu> {
+            if row < 0 || row as usize >= self.ivars().results.borrow().len() {
+                return None;
+            }
+            table.selectRowIndexes_byExtendingSelection(
+                &objc2_foundation::NSIndexSet::indexSetWithIndex(row as usize),
+                false,
+            );
+            self.ivars().result_menu.get().map(|menu| &**menu)
+        }
+
         #[unsafe(method(tableView:didClickTableColumn:))]
         fn did_click_table_column(&self, _table: &NSTableView, column: &NSTableColumn) {
             let field = match column.identifier().to_string().as_str() {
@@ -419,7 +449,7 @@ define_class!(
             let table_column = table_column.expect("table view requests a known column");
             let identifier = table_column.identifier().to_string();
             let value = match identifier.as_str() {
-                "name" => result.name.clone(),
+                "name" => format!("{}  {}", entry_kind_icon(result.kind), result.name),
                 "path" => result.path.to_string_lossy().into_owned(),
                 "modified" => format_file_time(
                     &self.ivars().date_formatter,
@@ -444,6 +474,11 @@ define_class!(
             };
             label.setTextColor(Some(&color));
             label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
+            if identifier == "name" {
+                if let Some(cell) = label.cell() {
+                    cell.setMenu(self.ivars().result_menu.get().map(|menu| &**menu));
+                }
+            }
             Some(label.into_super().into_super())
         }
     }
@@ -507,6 +542,26 @@ define_class!(
             self.dispatch_selected(ResultAction::CopyPath);
         }
 
+        #[unsafe(method(openSelected:))]
+        fn open_selected_action(&self, _sender: Option<&AnyObject>) {
+            self.dispatch_selected(ResultAction::Open);
+        }
+
+        #[unsafe(method(openSelectedWith:))]
+        fn open_selected_with_action(&self, _sender: Option<&AnyObject>) {
+            self.dispatch_selected(ResultAction::OpenWith);
+        }
+
+        #[unsafe(method(revealSelected:))]
+        fn reveal_selected_action(&self, _sender: Option<&AnyObject>) {
+            self.dispatch_selected(ResultAction::Reveal);
+        }
+
+        #[unsafe(method(copySelectedItem:))]
+        fn copy_selected_item_action(&self, _sender: Option<&AnyObject>) {
+            self.dispatch_selected(ResultAction::CopyItem);
+        }
+
         #[unsafe(method(sortByRelevance:))]
         fn sort_by_relevance_action(&self, _sender: Option<&AnyObject>) {
             self.select_sort(SortField::Relevance);
@@ -520,6 +575,20 @@ define_class!(
             if let Some(field) = sort_field_for_popup_index(popup.indexOfSelectedItem()) {
                 self.choose_sort_field(field);
             }
+        }
+
+        #[unsafe(method(filterSelectionChanged:))]
+        fn filter_selection_changed_action(&self, sender: Option<&AnyObject>) {
+            let Some(popup) = sender.and_then(|sender| sender.downcast_ref::<NSPopUpButton>()) else { return };
+            let filter = match popup.indexOfSelectedItem() {
+                1 => EntryFilter::Files,
+                2 => EntryFilter::Folders,
+                _ => EntryFilter::All,
+            };
+            self.ivars().entry_filter.set(filter);
+            self.ivars().requested_limit.set(100);
+            self.persist_entry_filter(filter);
+            self.run_search();
         }
 
         #[unsafe(method(sortByCreationTime:))]
@@ -997,6 +1066,7 @@ impl Delegate {
         let runtime = Arc::clone(&self.ivars().runtime);
         let sort = self.ivars().sort.get();
         let show_hidden = self.ivars().show_hidden.get();
+        let entry_filter = self.ivars().entry_filter.get();
         let limit = self.ivars().requested_limit.get();
         let _ = self
             .ivars()
@@ -1004,13 +1074,14 @@ impl Delegate {
             .get()
             .expect("scheduler initialized")
             .try_schedule(move || {
-                if let Ok(ranked) = projection.search_ranked_with_visibility(
+                if let Ok(ranked) = projection.search_ranked_with_filters(
                     &query,
                     &recent_opens,
                     limit,
                     sort,
                     &cancellation,
                     show_hidden,
+                    entry_filter,
                 ) && !ranked.cancelled
                 {
                     runtime.lock().unwrap().pending_query = Some(QueryPublication {
@@ -1068,6 +1139,39 @@ impl Delegate {
                 SortDirection::Descending => ns_string!("降序 ↕"),
             });
         }
+        if let Some(popup) = self.ivars().filter_popup.get() {
+            popup.selectItemAtIndex(match self.ivars().entry_filter.get() {
+                EntryFilter::All => 0,
+                EntryFilter::Files => 1,
+                EntryFilter::Folders => 2,
+            });
+        }
+        if let Some(table) = self.ivars().table.get() {
+            for column in table.tableColumns().iter() {
+                let identifier = column.identifier().to_string();
+                let base = match identifier.as_str() {
+                    "name" => "名称",
+                    "path" => "路径",
+                    "modified" => "修改时间",
+                    "created" => "创建时间",
+                    "size" => "大小",
+                    _ => continue,
+                };
+                let title = if sort.field == sort_field_for_column(&identifier) {
+                    format!(
+                        "{base} {}",
+                        if sort.direction == SortDirection::Ascending {
+                            "↑"
+                        } else {
+                            "↓"
+                        }
+                    )
+                } else {
+                    base.to_owned()
+                };
+                column.setTitle(&objc2_foundation::NSString::from_str(&title));
+            }
+        }
         if let Some(button) = self.ivars().hidden_button.get() {
             button.setTitle(if self.ivars().show_hidden.get() {
                 ns_string!("隐藏项目：显示  ⌘⇧.")
@@ -1075,6 +1179,28 @@ impl Delegate {
                 ns_string!("隐藏项目：隐藏  ⌘⇧.")
             });
         }
+    }
+
+    fn persist_entry_filter(&self, filter: EntryFilter) {
+        let value = match filter {
+            EntryFilter::All => 0,
+            EntryFilter::Files => 1,
+            EntryFilter::Folders => 2,
+        };
+        NSUserDefaults::standardUserDefaults()
+            .setInteger_forKey(value, ns_string!("EveryfileEntryFilter"));
+    }
+
+    fn restore_entry_filter(&self) {
+        self.ivars().entry_filter.set(
+            match NSUserDefaults::standardUserDefaults()
+                .integerForKey(ns_string!("EveryfileEntryFilter"))
+            {
+                1 => EntryFilter::Files,
+                2 => EntryFilter::Folders,
+                _ => EntryFilter::All,
+            },
+        );
     }
 
     fn restore_sort_order(&self) {
@@ -1158,6 +1284,11 @@ impl Delegate {
         drop(results);
 
         let succeeded = MacResultActionDispatcher.dispatch(action, &result);
+        if !succeeded {
+            if let Some(detail) = self.ivars().state_detail.get() {
+                detail.setStringValue(ns_string!("操作失败：请检查项目是否仍存在或权限是否足够"));
+            }
+        }
         if succeeded
             && action == ResultAction::Open
             && let Ok(store) = IndexStore::open(&default_data_directory().join("index.sqlite3"))
@@ -1630,12 +1761,50 @@ impl ResultActionDispatcher for MacResultActionDispatcher {
                 let url = NSURL::fileURLWithPath(&path);
                 NSWorkspace::sharedWorkspace().openURL(&url)
             }
+            ResultAction::OpenWith => {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    return false;
+                };
+                let panel = NSOpenPanel::openPanel(mtm);
+                panel.setCanChooseFiles(true);
+                panel.setCanChooseDirectories(true);
+                panel.setAllowsMultipleSelection(false);
+                panel.setTitle(Some(ns_string!("选择打开方式")));
+                if panel.runModal() != 1 {
+                    return false;
+                }
+                let Some(application) = panel.URLs().firstObject() else {
+                    return false;
+                };
+                let Some(application_path) = application.path() else {
+                    return false;
+                };
+                NSWorkspace::sharedWorkspace()
+                    .openFile_withApplication(&path, Some(&application_path))
+            }
             ResultAction::Reveal => NSWorkspace::sharedWorkspace()
                 .selectFile_inFileViewerRootedAtPath(Some(&path), ns_string!("")),
             ResultAction::CopyPath => {
                 let pasteboard = NSPasteboard::generalPasteboard();
                 pasteboard.clearContents();
                 pasteboard.setString_forType(&path, unsafe { NSPasteboardTypeString })
+            }
+            ResultAction::CopyItem => {
+                let pasteboard = NSPasteboard::generalPasteboard();
+                pasteboard.clearContents();
+                let url = NSURL::fileURLWithPath(&path);
+                let Some(url_string) = url.absoluteString() else {
+                    return false;
+                };
+                let urls = objc2_foundation::NSArray::from_retained_slice(&[url_string]);
+                let paths = objc2_foundation::NSArray::from_retained_slice(&[path.clone()]);
+                let legacy_file_names =
+                    objc2_foundation::NSString::from_str("NSFilenamesPboardType");
+                unsafe {
+                    let modern = pasteboard.setPropertyList_forType(&urls, NSPasteboardTypeFileURL);
+                    let legacy = pasteboard.setPropertyList_forType(&paths, &legacy_file_names);
+                    modern && legacy
+                }
             }
         }
     }
@@ -1657,6 +1826,17 @@ fn sort_popup_index(field: SortField) -> isize {
         SortField::FileName => 3,
         SortField::FullPath => 4,
         SortField::FileSize => 5,
+    }
+}
+
+fn sort_field_for_column(identifier: &str) -> SortField {
+    match identifier {
+        "name" => SortField::FileName,
+        "path" => SortField::FullPath,
+        "modified" => SortField::ModificationTime,
+        "created" => SortField::CreationTime,
+        "size" => SortField::FileSize,
+        _ => SortField::Relevance,
     }
 }
 
@@ -1682,6 +1862,15 @@ fn human_file_size(bytes: u64) -> String {
         1024..=1_048_575 => format!("{:.0} KB", bytes as f64 / KB),
         1_048_576..=1_073_741_823 => format!("{:.1} MB", bytes as f64 / MB),
         _ => format!("{:.1} GB", bytes as f64 / GB),
+    }
+}
+
+fn entry_kind_icon(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Directory => "📁",
+        EntryKind::File => "📄",
+        EntryKind::Symlink => "🔗",
+        EntryKind::Other => "◼",
     }
 }
 
@@ -1862,6 +2051,19 @@ fn build_search_window(
         NSSize::new(170.0, 32.0),
     ));
     toolbar.addSubview(&hidden_button);
+    let filter_popup = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(376.0, 9.0), NSSize::new(112.0, 32.0)),
+        false,
+    );
+    for title in ["全部", "文件", "文件夹"] {
+        filter_popup.addItemWithTitle(&objc2_foundation::NSString::from_str(title));
+    }
+    unsafe {
+        filter_popup.setTarget(Some(delegate));
+        filter_popup.setAction(Some(sel!(filterSelectionChanged:)));
+    }
+    toolbar.addSubview(&filter_popup);
 
     let table_frame = NSRect::new(NSPoint::new(0.0, 34.0), NSSize::new(1060.0, 442.0));
     let table_content = NSView::initWithFrame(NSView::alloc(mtm), table_frame);
@@ -1874,6 +2076,14 @@ fn build_search_window(
     table.setBackgroundColor(&NSColor::clearColor());
     table.setGridStyleMask(objc2_app_kit::NSTableViewGridLineStyle::empty());
     table.setIntercellSpacing(NSSize::new(0.0, 0.0));
+    unsafe {
+        table.setTarget(Some(delegate));
+        table.setDoubleAction(Some(sel!(openSelected:)));
+    }
+    let result_menu = build_result_menu(mtm, delegate);
+    unsafe {
+        table.setMenu(Some(&result_menu));
+    }
     add_table_column(mtm, &table, "name", "名称", 270.0);
     add_table_column(mtm, &table, "path", "路径", 570.0);
     add_table_column(mtm, &table, "modified", "修改时间", 130.0);
@@ -1945,7 +2155,34 @@ fn build_search_window(
         sort_popup,
         direction_button,
         hidden_button,
+        filter_popup,
+        result_menu,
     }
+}
+
+fn build_result_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMenu> {
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("结果操作"));
+    for (title, selector) in [
+        ("打开", sel!(openSelected:)),
+        ("打开方式…", sel!(openSelectedWith:)),
+        ("在 Finder 中显示", sel!(revealSelected:)),
+        ("拷贝项目", sel!(copySelectedItem:)),
+        ("拷贝路径", sel!(copySelectedPath:)),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &objc2_foundation::NSString::from_str(title),
+                Some(selector),
+                ns_string!(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(delegate));
+        }
+        menu.addItem(&item);
+    }
+    menu
 }
 
 fn build_glass_surface(
@@ -2115,6 +2352,42 @@ fn build_status_item(
         mtm,
         &menu,
         delegate,
+        ns_string!("Open Selected"),
+        sel!(openSelected:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Open Selected With…"),
+        sel!(openSelectedWith:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Reveal Selected in Finder"),
+        sel!(revealSelected:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
+        ns_string!("Copy Selected Item"),
+        sel!(copySelectedItem:),
+        ns_string!(""),
+        true,
+    );
+    add_menu_item(
+        mtm,
+        &menu,
+        delegate,
         ns_string!("External Volumes…"),
         sel!(showExternalVolumes:),
         ns_string!(""),
@@ -2184,13 +2457,31 @@ fn build_main_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMen
     let main_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Everyfile"));
     let edit_item = NSMenuItem::new(mtm);
     let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+    for (title, action, key) in [
+        ("Cut", sel!(cut:), "x"),
+        ("Copy", sel!(copy:), "c"),
+        ("Paste", sel!(paste:), "v"),
+        ("Select All", sel!(selectAll:), "a"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &objc2_foundation::NSString::from_str(title),
+                Some(action),
+                &objc2_foundation::NSString::from_str(key),
+            )
+        };
+        item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        edit_menu.addItem(&item);
+    }
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_menu_item(
         mtm,
         &edit_menu,
         delegate,
         ns_string!("Copy Path"),
         sel!(copySelectedPath:),
-        ns_string!("c"),
+        ns_string!(""),
         true,
     );
     let hidden_item = add_menu_item(

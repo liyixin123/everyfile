@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 use memmap2::{Mmap, MmapOptions};
 
 use crate::index::{CommittedIndex, IndexStore};
-use crate::model::{EntryKind, IndexedEntry, SearchResult};
+use crate::model::{EntryFilter, EntryKind, IndexedEntry, SearchResult};
 use crate::query::{
     BorrowedQueryCandidate, CancellationToken, RankedResults, SortOrder, normalize_search_text,
     rank_borrowed_candidates_with_options,
 };
 
 const MAGIC: &[u8; 8] = b"EVFLIDX\0";
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 const HEADER_LEN: usize = 28;
 const SORT_INDEX_COUNT: usize = 5;
 
@@ -298,7 +298,29 @@ impl SearchProjection {
         cancellation: &CancellationToken,
         show_hidden: bool,
     ) -> io::Result<RankedResults> {
-        if query.trim().is_empty()
+        self.search_ranked_with_filters(
+            query,
+            recent_opens,
+            limit,
+            sort,
+            cancellation,
+            show_hidden,
+            EntryFilter::All,
+        )
+    }
+
+    pub fn search_ranked_with_filters(
+        &self,
+        query: &str,
+        recent_opens: &HashMap<u64, u64>,
+        limit: usize,
+        sort: SortOrder,
+        cancellation: &CancellationToken,
+        show_hidden: bool,
+        filter: EntryFilter,
+    ) -> io::Result<RankedResults> {
+        if filter == EntryFilter::All
+            && query.trim().is_empty()
             && recent_opens.is_empty()
             && sort.direction == crate::query::SortDirection::Ascending
             && show_hidden
@@ -315,7 +337,9 @@ impl SearchProjection {
         };
         Ok(rank_borrowed_candidates_with_options(
             query,
-            candidates.filter(|candidate| show_hidden || !candidate.hidden),
+            candidates.filter(|candidate| {
+                (show_hidden || !candidate.hidden) && filter.includes(candidate.kind)
+            }),
             recent_opens,
             limit,
             sort,
@@ -397,6 +421,7 @@ fn candidate_result(candidate: BorrowedQueryCandidate<'_>) -> SearchResult {
         size: candidate.size,
         created_ns: candidate.created_ns,
         modified_ns: candidate.modified_ns,
+        kind: candidate.kind,
     }
 }
 
@@ -436,6 +461,7 @@ fn write_entry(file: &mut File, entry: &IndexedEntry, directory_id: u32) -> io::
     file.write_all(&name_len.to_le_bytes())?;
     file.write_all(&normalized_name_len.to_le_bytes())?;
     file.write_all(&[u8::from(entry.hidden)])?;
+    file.write_all(&[entry.kind.as_i64() as u8])?;
     file.write_all(name)?;
     file.write_all(normalized_name.as_bytes())
 }
@@ -565,8 +591,14 @@ fn candidate_at<'a>(
     let normalized_name_len =
         read_u16(map, offset + 38).expect("projection was validated") as usize;
     let hidden = map[offset + 40] != 0;
-    let name = read_str(map, offset + 41, name_len).expect("projection was validated");
-    let normalized_name = read_str(map, offset + 41 + name_len, normalized_name_len)
+    let kind = match map[offset + 41] {
+        1 => EntryKind::File,
+        2 => EntryKind::Directory,
+        3 => EntryKind::Symlink,
+        _ => EntryKind::Other,
+    };
+    let name = read_str(map, offset + 42, name_len).expect("projection was validated");
+    let normalized_name = read_str(map, offset + 42 + name_len, normalized_name_len)
         .expect("projection was validated");
     let (directory_offset, directory_len) = directories[directory_id];
     let parent_path =
@@ -589,8 +621,9 @@ fn candidate_at<'a>(
             created_ns: (raw_created != i64::MIN).then_some(raw_created),
             modified_ns: (raw_modified != i64::MIN).then_some(raw_modified),
             hidden,
+            kind,
         },
-        offset + 41 + name_len + normalized_name_len,
+        offset + 42 + name_len + normalized_name_len,
     )
 }
 
@@ -629,7 +662,7 @@ fn validate_records(
         let name_len = read_u16(map, offset + 36)? as usize;
         let normalized_name_len = read_u16(map, offset + 38)? as usize;
         offset = offset
-            .checked_add(41)
+            .checked_add(42)
             .and_then(|value| value.checked_add(name_len))
             .and_then(|value| value.checked_add(normalized_name_len))
             .ok_or_else(|| invalid("projection offsets overflow"))?;
@@ -836,10 +869,12 @@ mod tests {
                             size: entry.size,
                             created_ns: entry.created_ns,
                             modified_ns: entry.modified_ns,
+                            kind: entry.kind,
                         },
                         normalized_name: normalize_search_text(&entry.name),
                         normalized_path: normalize_search_text(&entry.path.to_string_lossy()),
                         hidden: entry.hidden,
+                        kind: entry.kind,
                     }),
                 &HashMap::new(),
                 100,
