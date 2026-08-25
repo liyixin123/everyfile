@@ -2074,6 +2074,10 @@ fn build_search_window(
         table.setTarget(Some(delegate));
         table.setDoubleAction(Some(sel!(openSelected:)));
     }
+    let result_menu = build_result_menu(mtm, delegate);
+    unsafe {
+        table.setMenu(Some(&result_menu));
+    }
     add_table_column(mtm, &table, "name", "名称", 270.0);
     add_table_column(mtm, &table, "path", "路径", 570.0);
     add_table_column(mtm, &table, "modified", "修改时间", 130.0);
@@ -2146,7 +2150,7 @@ fn build_search_window(
         direction_button,
         hidden_button,
         filter_popup,
-        result_menu: build_result_menu(mtm, delegate),
+        result_menu,
     }
 }
 
