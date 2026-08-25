@@ -384,8 +384,6 @@ define_class!(
                     ResultAction::Open
                 };
                 self.dispatch_selected(action)
-            } else if command_selector == sel!(copy:) {
-                self.dispatch_selected(ResultAction::CopyPath)
             } else {
                 false
             }
@@ -2459,13 +2457,31 @@ fn build_main_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMen
     let main_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Everyfile"));
     let edit_item = NSMenuItem::new(mtm);
     let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+    for (title, action, key) in [
+        ("Cut", sel!(cut:), "x"),
+        ("Copy", sel!(copy:), "c"),
+        ("Paste", sel!(paste:), "v"),
+        ("Select All", sel!(selectAll:), "a"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &objc2_foundation::NSString::from_str(title),
+                Some(action),
+                &objc2_foundation::NSString::from_str(key),
+            )
+        };
+        item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        edit_menu.addItem(&item);
+    }
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_menu_item(
         mtm,
         &edit_menu,
         delegate,
         ns_string!("Copy Path"),
         sel!(copySelectedPath:),
-        ns_string!("c"),
+        ns_string!(""),
         true,
     );
     let hidden_item = add_menu_item(
