@@ -37,3 +37,9 @@ package: test app
     mkdir -p dist
     ditto -c -k --sequesterRsrc --keepParent "{{app}}" "{{archive}}"
     @echo "Packaged {{archive}}"
+
+# Build a DMG containing the signed release application.
+dmg: app
+    mkdir -p dist
+    hdiutil create -volname Everyfile -srcfolder "{{app}}" -ov -format UDZO "dist/Everyfile.dmg"
+    @echo "Packaged dist/Everyfile.dmg"
