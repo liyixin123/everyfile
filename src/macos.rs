@@ -16,12 +16,12 @@ use objc2_app_kit::{
     NSAppearance, NSAppearanceNameDarkAqua, NSApplication, NSApplicationActivationPolicy,
     NSApplicationDelegate, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor,
     NSControl, NSControlTextEditingDelegate, NSEventModifierFlags, NSFloatingWindowLevel, NSFont,
-    NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSMenu, NSMenuItem, NSOpenPanel,
-    NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
-    NSStatusBar, NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource,
-    NSTableViewDelegate, NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength,
-    NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidMountNotification,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSMenu, NSMenuItem, NSOpenPanel, NSPasteboard,
+    NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSStatusBar,
+    NSStatusItem, NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
+    NSTextField, NSTextFieldDelegate, NSTextView, NSVariableStatusItemLength, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindow, NSWindowStyleMask, NSWorkspace, NSWorkspaceDidMountNotification,
     NSWorkspaceDidUnmountNotification, NSWorkspaceDidWakeNotification,
 };
 use objc2_foundation::{
@@ -119,6 +119,7 @@ struct AppDelegateIvars {
     direction_button: OnceCell<Retained<NSButton>>,
     hidden_button: OnceCell<Retained<NSButton>>,
     filter_popup: OnceCell<Retained<NSPopUpButton>>,
+    result_menu: OnceCell<Retained<NSMenu>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
     status_state_item: OnceCell<Retained<NSMenuItem>>,
     skipped_locations_item: OnceCell<Retained<NSMenuItem>>,
@@ -127,7 +128,6 @@ struct AppDelegateIvars {
     results: RefCell<Vec<SearchResult>>,
     state_title_cache: RefCell<Option<String>>,
     state_detail_cache: RefCell<Option<String>>,
-    icons: RefCell<HashMap<EntryKind, Retained<NSImage>>>,
     hot_key: Cell<EventHotKeyRef>,
     launch: Instant,
     sort: Cell<SortOrder>,
@@ -180,6 +180,7 @@ struct SearchWindowParts {
     direction_button: Retained<NSButton>,
     hidden_button: Retained<NSButton>,
     filter_popup: Retained<NSPopUpButton>,
+    result_menu: Retained<NSMenu>,
 }
 
 impl Default for AppDelegateIvars {
@@ -195,6 +196,7 @@ impl Default for AppDelegateIvars {
             direction_button: OnceCell::new(),
             hidden_button: OnceCell::new(),
             filter_popup: OnceCell::new(),
+            result_menu: OnceCell::new(),
             status_item: OnceCell::new(),
             status_state_item: OnceCell::new(),
             skipped_locations_item: OnceCell::new(),
@@ -215,7 +217,6 @@ impl Default for AppDelegateIvars {
             results: RefCell::new(Vec::new()),
             state_title_cache: RefCell::new(None),
             state_detail_cache: RefCell::new(None),
-            icons: RefCell::new(HashMap::new()),
             hot_key: Cell::new(ptr::null_mut()),
             launch: Instant::now(),
             sort: Cell::new(SortOrder::default()),
@@ -281,6 +282,7 @@ define_class!(
                 .unwrap();
             self.ivars().hidden_button.set(parts.hidden_button).unwrap();
             self.ivars().filter_popup.set(parts.filter_popup).unwrap();
+            self.ivars().result_menu.set(parts.result_menu).unwrap();
             self.sync_search_controls();
             let (status_item, status_state_item, skipped_locations_item) =
                 build_status_item(mtm, self);
@@ -396,16 +398,6 @@ define_class!(
         #[unsafe(method(tableView:shouldSelectRow:))]
         fn should_select_row(&self, _table: &NSTableView, _row: isize) -> bool { true }
 
-        #[unsafe(method(tableView:didDoubleClickTableColumn:row:))]
-        fn did_double_click(&self, _table: &NSTableView, _column: Option<&NSTableColumn>, row: isize) {
-            if let Some(table) = self.ivars().table.get() {
-                table.selectRowIndexes_byExtendingSelection(
-                    &objc2_foundation::NSIndexSet::indexSetWithIndex(row as usize), false,
-                );
-            }
-            self.dispatch_selected(ResultAction::Open);
-        }
-
         #[unsafe(method(tableView:didClickTableColumn:))]
         fn did_click_table_column(&self, _table: &NSTableView, column: &NSTableColumn) {
             let field = match column.identifier().to_string().as_str() {
@@ -442,7 +434,7 @@ define_class!(
             let table_column = table_column.expect("table view requests a known column");
             let identifier = table_column.identifier().to_string();
             let value = match identifier.as_str() {
-                "name" => result.name.clone(),
+                "name" => format!("{}  {}", entry_kind_icon(result.kind), result.name),
                 "path" => result.path.to_string_lossy().into_owned(),
                 "modified" => format_file_time(
                     &self.ivars().date_formatter,
@@ -468,9 +460,8 @@ define_class!(
             label.setTextColor(Some(&color));
             label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
             if identifier == "name" {
-                let icon = self.icon_for_kind(result.kind);
                 if let Some(cell) = label.cell() {
-                    cell.setImage(Some(&icon));
+                    cell.setMenu(self.ivars().result_menu.get().map(|menu| &**menu));
                 }
             }
             Some(label.into_super().into_super())
@@ -1298,23 +1289,6 @@ impl Delegate {
         succeeded
     }
 
-    fn icon_for_kind(&self, kind: EntryKind) -> Retained<NSImage> {
-        if let Some(icon) = self.ivars().icons.borrow().get(&kind) {
-            return icon.clone();
-        }
-        let type_name = match kind {
-            EntryKind::Directory => "public.folder",
-            EntryKind::File => "public.data",
-            EntryKind::Symlink => "public.symlink",
-            EntryKind::Other => "public.item",
-        };
-        let icon = NSWorkspace::sharedWorkspace()
-            .iconForFileType(&objc2_foundation::NSString::from_str(type_name));
-        icon.setSize(NSSize::new(16.0, 16.0));
-        self.ivars().icons.borrow_mut().insert(kind, icon.clone());
-        icon
-    }
-
     fn clear_open_history(&self) {
         if let Ok(store) = IndexStore::open(&default_data_directory().join("index.sqlite3")) {
             let _ = store.clear_open_history();
@@ -1868,6 +1842,15 @@ fn human_file_size(bytes: u64) -> String {
     }
 }
 
+fn entry_kind_icon(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Directory => "📁",
+        EntryKind::File => "📄",
+        EntryKind::Symlink => "🔗",
+        EntryKind::Other => "◼",
+    }
+}
+
 fn format_file_time(
     formatter: &OnceCell<Retained<NSDateFormatter>>,
     nanoseconds_since_epoch: Option<i64>,
@@ -2070,6 +2053,10 @@ fn build_search_window(
     table.setBackgroundColor(&NSColor::clearColor());
     table.setGridStyleMask(objc2_app_kit::NSTableViewGridLineStyle::empty());
     table.setIntercellSpacing(NSSize::new(0.0, 0.0));
+    unsafe {
+        table.setTarget(Some(delegate));
+        table.setDoubleAction(Some(sel!(openSelected:)));
+    }
     add_table_column(mtm, &table, "name", "名称", 270.0);
     add_table_column(mtm, &table, "path", "路径", 570.0);
     add_table_column(mtm, &table, "modified", "修改时间", 130.0);
@@ -2142,7 +2129,33 @@ fn build_search_window(
         direction_button,
         hidden_button,
         filter_popup,
+        result_menu: build_result_menu(mtm, delegate),
     }
+}
+
+fn build_result_menu(mtm: MainThreadMarker, delegate: &Delegate) -> Retained<NSMenu> {
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("结果操作"));
+    for (title, selector) in [
+        ("打开", sel!(openSelected:)),
+        ("打开方式…", sel!(openSelectedWith:)),
+        ("在 Finder 中显示", sel!(revealSelected:)),
+        ("拷贝项目", sel!(copySelectedItem:)),
+        ("拷贝路径", sel!(copySelectedPath:)),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &objc2_foundation::NSString::from_str(title),
+                Some(selector),
+                ns_string!(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(delegate));
+        }
+        menu.addItem(&item);
+    }
+    menu
 }
 
 fn build_glass_surface(
