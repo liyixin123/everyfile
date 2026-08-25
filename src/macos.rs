@@ -1799,7 +1799,14 @@ impl ResultActionDispatcher for MacResultActionDispatcher {
                     return false;
                 };
                 let urls = objc2_foundation::NSArray::from_retained_slice(&[url_string]);
-                unsafe { pasteboard.setPropertyList_forType(&urls, NSPasteboardTypeFileURL) }
+                let paths = objc2_foundation::NSArray::from_retained_slice(&[path.clone()]);
+                let legacy_file_names =
+                    objc2_foundation::NSString::from_str("NSFilenamesPboardType");
+                unsafe {
+                    let modern = pasteboard.setPropertyList_forType(&urls, NSPasteboardTypeFileURL);
+                    let legacy = pasteboard.setPropertyList_forType(&paths, &legacy_file_names);
+                    modern && legacy
+                }
             }
         }
     }
