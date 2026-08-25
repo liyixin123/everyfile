@@ -31,3 +31,13 @@ _Avoid_: Command, Advanced Query
 **Relevance**:
 The default result order based primarily on match quality in the file name and secondarily on path match quality and Everyfile open history.
 _Avoid_: Sort Score, Spotlight Rank
+
+**Indexed Entry Type**:
+The filesystem kind recorded for an indexed path: File, Directory, Symlink, or Other.
+_Avoid_: Result Category when referring to the stored filesystem kind.
+
+**Result Filter**:
+The Quick Search Window choice controlling whether results include files, folders, or all indexed entry types.
+
+**Result Action**:
+An operation applied to a selected Search Result, such as Open, Open With, Reveal, Copy Item, or Copy Path.

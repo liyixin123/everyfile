@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
-use crate::model::SearchResult;
+use crate::model::{EntryKind, SearchResult};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RelevanceClass {
@@ -24,6 +24,7 @@ pub struct QueryCandidate {
     pub normalized_name: String,
     pub normalized_path: String,
     pub hidden: bool,
+    pub kind: EntryKind,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +38,7 @@ pub struct BorrowedQueryCandidate<'a> {
     pub created_ns: Option<i64>,
     pub modified_ns: Option<i64>,
     pub hidden: bool,
+    pub kind: EntryKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,6 +341,7 @@ pub fn rank_borrowed_candidates_with_options<'a>(
                 size: entry.candidate.size,
                 created_ns: entry.candidate.created_ns,
                 modified_ns: entry.candidate.modified_ns,
+                kind: entry.candidate.kind,
             })
             .collect(),
         exact_total,
@@ -630,10 +633,12 @@ mod tests {
                 size: 0,
                 created_ns: None,
                 modified_ns: None,
+                kind: EntryKind::File,
             },
             normalized_name: normalize_search_text(name),
             normalized_path: normalize_search_text(path),
             hidden: false,
+            kind: EntryKind::File,
         }
     }
 

@@ -3,7 +3,9 @@ use crate::model::SearchResult;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultAction {
     Open,
+    OpenWith,
     Reveal,
+    CopyItem,
     CopyPath,
 }
 
@@ -16,6 +18,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::model::EntryKind;
 
     #[derive(Default)]
     struct RecordingDispatcher(Vec<(ResultAction, PathBuf)>);
@@ -36,6 +39,7 @@ mod tests {
             size: 0,
             created_ns: None,
             modified_ns: None,
+            kind: EntryKind::File,
         };
         let mut dispatcher = RecordingDispatcher::default();
         assert!(dispatcher.dispatch(ResultAction::Reveal, &result));
