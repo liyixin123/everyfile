@@ -398,6 +398,23 @@ define_class!(
         #[unsafe(method(tableView:shouldSelectRow:))]
         fn should_select_row(&self, _table: &NSTableView, _row: isize) -> bool { true }
 
+        #[unsafe(method(tableView:menuForTableColumn:row:))]
+        fn menu_for_table_row(
+            &self,
+            table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: isize,
+        ) -> Option<&NSMenu> {
+            if row < 0 || row as usize >= self.ivars().results.borrow().len() {
+                return None;
+            }
+            table.selectRowIndexes_byExtendingSelection(
+                &objc2_foundation::NSIndexSet::indexSetWithIndex(row as usize),
+                false,
+            );
+            self.ivars().result_menu.get().map(|menu| &**menu)
+        }
+
         #[unsafe(method(tableView:didClickTableColumn:))]
         fn did_click_table_column(&self, _table: &NSTableView, column: &NSTableColumn) {
             let field = match column.identifier().to_string().as_str() {
